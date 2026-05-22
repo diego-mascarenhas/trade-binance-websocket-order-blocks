@@ -52,6 +52,8 @@ The **only entry script** in this project is `main.sh` (project root). All logic
 | `CLOSE_ON_OPPOSITE` | Close position when opposite OB is touched | `true` |
 
 In **hedge mode**, the bot blocks a second direction on the same symbol: any open position (LONG or SHORT leg), both entry limits at once, or a new order while the opposite-side limit is still on the book (after `REPLACE_STALE_LIMITS` cancels the old one).
+
+On startup (with API keys), the bot syncs **open positions and pending entry limits** for every symbol in `SYMBOLS`, restores local state (`ACTIVE`, direction, entry, SL/TP from Binance), and logs what it found.
 | `LOCK_PROFIT_ENABLED` | Move SL toward break-even as price nears TP (REST only) | `true` |
 | `LOCK_PROFIT_BE_PCT` | % of entry→TP distance before SL moves to break-even | `70` |
 | `LOCK_PROFIT_BUFFER_PCT` | % buffer above/below entry at break-even | `0.05` |

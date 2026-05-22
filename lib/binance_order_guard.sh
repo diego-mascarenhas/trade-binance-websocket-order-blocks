@@ -173,20 +173,271 @@ $pnl_msg"
     return 0
 }
 
-# Clear local ACTIVE/DCA when exchange has no real position
+# Echo entry price for a position leg (LONG|SHORT), or empty
+futures_get_position_entry_price() {
+    local symbol="$1"
+    local leg="$2"
+    local positions entry
+
+    if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
+        return 1
+    fi
+    leg=$(echo "$leg" | tr '[:lower:]' '[:upper:]')
+    positions=$(_binance_fapi_signed_get "/fapi/v2/positionRisk" "symbol=${symbol}")
+    entry=$(echo "$positions" | jq -r --arg sym "$symbol" --arg ps "$leg" '
+        .[] | select(.symbol == $sym)
+        | if ($ps == "LONG" or $ps == "SHORT") then
+            select(.positionSide == $ps)
+          else . end
+        | select(.positionAmt != "0" and .positionAmt != "0.000" and .positionAmt != "0.0")
+        | .entryPrice' 2>/dev/null | head -1)
+    if [ -z "$entry" ] || [ "$entry" = "null" ]; then
+        entry=$(echo "$positions" | jq -r --arg sym "$symbol" '
+            .[] | select(.symbol == $sym)
+            | select(.positionAmt != "0" and .positionAmt != "0.000" and .positionAmt != "0.0")
+            | .entryPrice' 2>/dev/null | head -1)
+    fi
+    if declare -f _bn_sanitize_num >/dev/null 2>&1; then
+        entry=$(_bn_sanitize_num "$entry")
+    fi
+    if [ -n "$entry" ] && _bn_is_positive "$entry" 2>/dev/null; then
+        if declare -f round_price_for_symbol >/dev/null 2>&1; then
+            entry=$(round_price_for_symbol "$symbol" "$entry")
+        fi
+        echo "$entry"
+        return 0
+    fi
+    return 1
+}
+
+# Echo "sl|tp" from open algo orders for position direction (prices may be empty)
+futures_get_open_sl_tp() {
+    local symbol="$1"
+    local direction="$2"
+    local resp sl tp want_ps
+
+    if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
+        echo "|"
+        return 1
+    fi
+    direction=$(echo "$direction" | tr '[:lower:]' '[:upper:]')
+    want_ps="$direction"
+    resp=$(_binance_fapi_signed_get "/fapi/v1/openAlgoOrders" "symbol=${symbol}")
+    [ -z "$resp" ] && echo "|" && return 1
+
+    sl=$(echo "$resp" | jq -r --arg ps "$want_ps" '
+        (if .orders then .orders else . end) | .[]?
+        | select(.orderType == "STOP_MARKET" or .orderType == "STOP" or .type == "STOP_MARKET")
+        | select(
+            (.algoStatus // .status // "NEW") == "NEW"
+            or (.algoStatus // .status) == "ACTIVE"
+          )
+        | select(
+            ($ps == "") or (.positionSide // "") == $ps or (.positionSide // "") == ""
+          )
+        | (.triggerPrice // .stopPrice // .price) | tostring' 2>/dev/null | head -1)
+
+    tp=$(echo "$resp" | jq -r --arg ps "$want_ps" '
+        (if .orders then .orders else . end) | .[]?
+        | select(.orderType == "TAKE_PROFIT_MARKET" or .orderType == "TAKE_PROFIT" or .type == "TAKE_PROFIT_MARKET")
+        | select(
+            (.algoStatus // .status // "NEW") == "NEW"
+            or (.algoStatus // .status) == "ACTIVE"
+          )
+        | select(
+            ($ps == "") or (.positionSide // "") == $ps or (.positionSide // "") == ""
+          )
+        | (.triggerPrice // .stopPrice // .price) | tostring' 2>/dev/null | head -1)
+
+    if declare -f round_price_for_symbol >/dev/null 2>&1; then
+        [ -n "$sl" ] && [ "$sl" != "null" ] && sl=$(round_price_for_symbol "$symbol" "$sl")
+        [ -n "$tp" ] && [ "$tp" != "null" ] && tp=$(round_price_for_symbol "$symbol" "$tp")
+    fi
+    echo "${sl:-}|${tp:-}"
+}
+
+# Set local ACTIVE / POS_DIR / LAST_* from an open leg on the exchange
+_futures_hydrate_open_leg() {
+    local symbol="$1"
+    local direction="$2"
+    local sl_tp entry sl tp
+
+    ob_set ACTIVE "$symbol" "true"
+    ob_set POS_DIR "$symbol" "$direction"
+    ob_set EXIT_NOTIFIED "$symbol" ""
+
+    if entry=$(futures_get_position_entry_price "$symbol" "$direction" 2>/dev/null); then
+        ob_set LAST_ENTRY "$symbol" "$entry"
+    fi
+
+    sl_tp=$(futures_get_open_sl_tp "$symbol" "$direction" 2>/dev/null || echo "|")
+    sl=$(echo "$sl_tp" | cut -d'|' -f1)
+    tp=$(echo "$sl_tp" | cut -d'|' -f2)
+    [ -n "$sl" ] && [ "$sl" != "null" ] && ob_set LAST_SL "$symbol" "$sl"
+    [ -n "$tp" ] && [ "$tp" != "null" ] && ob_set LAST_TP "$symbol" "$tp"
+}
+
+# Mark symbol active from a pending entry LIMIT (no filled position yet)
+_futures_hydrate_pending_entry() {
+    local symbol="$1"
+    local direction="$2"
+    local limit_price="${3:-}"
+
+    ob_set ACTIVE "$symbol" "true"
+    ob_set POS_DIR "$symbol" "$direction"
+    ob_set EXIT_NOTIFIED "$symbol" ""
+    if [ -n "$limit_price" ] && [ "$limit_price" != "0" ]; then
+        if declare -f round_price_for_symbol >/dev/null 2>&1; then
+            limit_price=$(round_price_for_symbol "$symbol" "$limit_price")
+        fi
+        ob_set LAST_ENTRY "$symbol" "$limit_price"
+    fi
+}
+
+# First pending entry LIMIT direction + price: LONG|price, SHORT|price, or empty
+futures_get_pending_entry_limit() {
+    local symbol="$1"
+    local orders line oside pos_side direction price
+
+    if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
+        return 1
+    fi
+    orders=$(_binance_fapi_signed_get "/fapi/v1/openOrders" "symbol=${symbol}")
+    [ -z "$orders" ] && return 1
+    echo "$orders" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+
+    for direction in LONG SHORT; do
+        if futures_has_open_limit_same_side "$symbol" "$direction"; then
+            line=$(echo "$orders" | jq -r --arg dir "$direction" '
+                .[] | select(.type == "LIMIT" or .type == "LIMIT_MAKER")
+                | . as $o
+                | ($dir == "LONG") as $want_long
+                | select(
+                    if $want_long then .side == "BUY" else .side == "SELL" end
+                  )
+                | select(
+                    ($dir == "LONG" and (($o.positionSide // "") == "LONG" or ($o.positionSide // "") == ""))
+                    or ($dir == "SHORT" and (($o.positionSide // "") == "SHORT" or ($o.positionSide // "") == ""))
+                  )
+                | .price' 2>/dev/null | head -1)
+            if [ -n "$line" ] && [ "$line" != "null" ]; then
+                echo "${direction}|${line}"
+                return 0
+            fi
+            echo "${direction}|"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# On startup: sync all configured symbols and log open exposure (positions / pending limits)
+sync_startup_configured_positions() {
+    local log_fn="${1:-}"
+    shift
+    local symbols=("$@")
+    local sym pos_info pending dual_warn=0 found=0
+    local dir qty entry sl tp pending_line
+
+    if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
+        [ -n "$log_fn" ] && $log_fn "⚠️ No API keys — skipping startup position sync"
+        return 1
+    fi
+    if ! declare -f ob_set >/dev/null 2>&1; then
+        return 1
+    fi
+
+    [ -n "$log_fn" ] && $log_fn "🔍 Syncing open positions for ${#symbols[@]} configured symbol(s)..."
+
+    for sym in "${symbols[@]}"; do
+        sync_symbol_position_flags "$sym"
+
+        if declare -f futures_has_conflicting_entry_limits >/dev/null 2>&1 \
+            && futures_has_conflicting_entry_limits "$sym"; then
+            [ -n "$log_fn" ] && $log_fn "⚠️ $sym: LONG and SHORT entry limits on book — resolve manually"
+            found=$((found + 1))
+            continue
+        fi
+
+        if declare -f binance_is_hedge_mode >/dev/null 2>&1 && binance_is_hedge_mode; then
+            local pos_long pos_short
+            pos_long=$(futures_get_position "$sym" "LONG")
+            pos_short=$(futures_get_position "$sym" "SHORT")
+            if [ "$pos_long" != "none" ] && [ "$pos_short" != "none" ]; then
+                dual_warn=$((dual_warn + 1))
+                [ -n "$log_fn" ] && $log_fn "⚠️ $sym: dual hedge position (LONG + SHORT) — bot tracks primary leg only"
+            fi
+        fi
+
+        if futures_has_open_position "$sym"; then
+            pos_info=$(futures_get_position "$sym")
+            dir=$(echo "$pos_info" | cut -d'|' -f1)
+            qty=$(echo "$pos_info" | cut -d'|' -f2)
+            entry=$(ob_get LAST_ENTRY "$sym")
+            sl=$(ob_get LAST_SL "$sym")
+            tp=$(ob_get LAST_TP "$sym")
+            [ -n "$log_fn" ] && $log_fn "📍 $sym: open ${dir} position qty=${qty} entry=${entry:-?} sl=${sl:-?} tp=${tp:-?}"
+            found=$((found + 1))
+            continue
+        fi
+
+        if pending_line=$(futures_get_pending_entry_limit "$sym" 2>/dev/null); then
+            dir=$(echo "$pending_line" | cut -d'|' -f1)
+            entry=$(echo "$pending_line" | cut -d'|' -f2)
+            [ -n "$log_fn" ] && $log_fn "📋 $sym: pending ${dir} entry limit @ ${entry:-?}"
+            found=$((found + 1))
+        fi
+    done
+
+    if [ "$found" -eq 0 ]; then
+        [ -n "$log_fn" ] && $log_fn "✅ No open positions or entry limits on configured symbols"
+    elif [ "$dual_warn" -gt 0 ]; then
+        [ -n "$log_fn" ] && $log_fn "⚠️ ${dual_warn} symbol(s) with dual hedge exposure"
+    fi
+    return 0
+}
+
+# Sync local ACTIVE/DCA with exchange; hydrate entry/TP/SL when position or limit exists
 sync_symbol_position_flags() {
     local symbol="$1"
     if ! declare -f ob_set >/dev/null 2>&1; then
         return 0
     fi
-    local was_active=false skip_exit=0 suppress_ts pos_info
+    local was_active=false skip_exit=0 suppress_ts pos_info pos_long pos_short
+    local pending_line pending_dir pending_price
+
     if [ "$(ob_get ACTIVE "$symbol")" = "true" ]; then
         was_active=true
     fi
 
-    pos_info=$(futures_get_position "$symbol")
+    if declare -f binance_is_hedge_mode >/dev/null 2>&1 && binance_is_hedge_mode; then
+        pos_long=$(futures_get_position "$symbol" "LONG")
+        pos_short=$(futures_get_position "$symbol" "SHORT")
+        if [ "$pos_long" != "none" ] && [ "$pos_short" != "none" ]; then
+            dual_open=true
+            pos_info="$pos_long"
+        elif [ "$pos_long" != "none" ]; then
+            pos_info="$pos_long"
+        elif [ "$pos_short" != "none" ]; then
+            pos_info="$pos_short"
+        else
+            pos_info="none"
+        fi
+    else
+        pos_info=$(futures_get_position "$symbol")
+    fi
+
     if [ "$pos_info" != "none" ]; then
-        ob_set EXIT_NOTIFIED "$symbol" ""
+        local hydrate_dir
+        hydrate_dir=$(echo "$pos_info" | cut -d'|' -f1)
+        _futures_hydrate_open_leg "$symbol" "$hydrate_dir"
+        return 0
+    fi
+
+    if pending_line=$(futures_get_pending_entry_limit "$symbol" 2>/dev/null); then
+        pending_dir=$(echo "$pending_line" | cut -d'|' -f1)
+        pending_price=$(echo "$pending_line" | cut -d'|' -f2)
+        _futures_hydrate_pending_entry "$symbol" "$pending_dir" "$pending_price"
         return 0
     fi
 

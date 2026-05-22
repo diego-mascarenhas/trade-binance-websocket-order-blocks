@@ -1031,11 +1031,6 @@ draw_and_execute() {
         resistance=$(ob_get RESISTANCE "$symbol")
         change=$(ob_get CHANGE24 "$symbol")
 
-        pos_col="--"
-        if [ "$(ob_get ACTIVE "$symbol")" = "true" ]; then
-            pos_col="OPEN"
-        fi
-
         spread=0
         if [ "$best_bid" != "0" ] && [ "$best_ask" != "0" ] && [ "$best_bid" != "null" ] && [ "$best_ask" != "null" ]; then
             spread=$(echo "$best_ask - $best_bid" | bc -l 2>/dev/null)
@@ -1043,6 +1038,14 @@ draw_and_execute() {
 
         if declare -f sync_symbol_position_flags >/dev/null 2>&1; then
             sync_symbol_position_flags "$symbol"
+        fi
+
+        pos_col="--"
+        if [ "$(ob_get ACTIVE "$symbol")" = "true" ]; then
+            pos_col="OPEN"
+        elif declare -f futures_has_open_position >/dev/null 2>&1 \
+            && futures_has_open_position "$symbol"; then
+            pos_col="OPEN"
         fi
 
         closed_flag=0
@@ -1276,6 +1279,12 @@ main() {
         fi
     else
         log_error "Could not detect position mode (set BINANCE_POSITION_MODE=hedge or oneway in .env)"
+    fi
+
+    if declare -f sync_startup_configured_positions >/dev/null 2>&1 \
+        && [ -n "$BINANCE_API_KEY" ] && [ -n "$BINANCE_SECRET_KEY" ]; then
+        sync_startup_configured_positions log "${SYMBOL_ARRAY[@]}"
+        log_trade "STARTUP_SYNC symbols=${SYMBOLS}"
     fi
     
     if ! command -v jq &> /dev/null; then
