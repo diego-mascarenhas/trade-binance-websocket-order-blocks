@@ -38,6 +38,10 @@ if [ -f "$SCRIPT_DIR/lib/ob_wall_history.sh" ]; then
     # shellcheck source=lib/ob_wall_history.sh
     source "$SCRIPT_DIR/lib/ob_wall_history.sh"
 fi
+if [ -f "$SCRIPT_DIR/lib/trading_schedule.sh" ]; then
+    # shellcheck source=lib/trading_schedule.sh
+    source "$SCRIPT_DIR/lib/trading_schedule.sh"
+fi
 if [ ! -f "$SCRIPT_DIR/lib/binance_timestamp.sh" ]; then
     echo "❌ Error: lib/binance_timestamp.sh not found in $SCRIPT_DIR/lib/"
     exit 1
@@ -99,6 +103,12 @@ LEVERAGE="${LEVERAGE:-5}"
 
 # Cooldown between orders for same symbol (seconds)
 ORDER_COOLDOWN_SECONDS="${ORDER_COOLDOWN:-300}"
+
+# Trading window (UTC) — same as trade-deepseek
+TRADING_SCHEDULE_ENABLED="${TRADING_SCHEDULE_ENABLED:-true}"
+EXECUTION_HOUR_START="${EXECUTION_HOUR_START:-0}"
+EXECUTION_HOUR_END="${EXECUTION_HOUR_END:-23}"
+ALLOWED_DAYS="${ALLOWED_DAYS:-1,2,3,4,5,6,7}"
 
 # Cancel unfilled entry LIMIT(s) when a new signal arrives (REST only)
 REPLACE_STALE_LIMITS="${REPLACE_STALE_LIMITS:-true}"
@@ -575,8 +585,16 @@ ob_replace_stale_entry_limits() {
 
 send_order() {
     local symbol="$1" direction="$2" entry="$3" sl="$4" tp="$5"
-    local replace_rc=0
-    
+    local replace_rc=0 sched_reason
+
+    if declare -f is_trading_time_allowed >/dev/null 2>&1 \
+        && ! is_trading_time_allowed; then
+        sched_reason=$(trading_schedule_block_reason 2>/dev/null)
+        log_trade "SKIP_ORDER $symbol $direction entry=$entry reason=outside_schedule ${sched_reason}"
+        log "⏸️ $symbol: outside trading schedule (${sched_reason}) — order skipped"
+        return 0
+    fi
+
     entry=$(round_price_for_symbol "$symbol" "$entry")
     sl=$(round_price_for_symbol "$symbol" "$sl")
     tp=$(round_price_for_symbol "$symbol" "$tp")
@@ -1160,11 +1178,16 @@ draw_and_execute() {
         fi
 
         if [ "$signal_dir" != "NEUTRAL" ] && [ "$confidence" -ge "$MIN_CONFIDENCE" ] && [ "$closed_flag" -eq 0 ]; then
-            local grid_extra=""
+            local grid_extra="" sched_reason=""
             if declare -f ob_tp_sl_mode_is_grid >/dev/null 2>&1 && ob_tp_sl_mode_is_grid; then
                 grid_extra=" R0=$(ob_get SIGNAL_R0 "$symbol") R1=$(ob_get SIGNAL_R1 "$symbol") R2=$(ob_get SIGNAL_R2 "$symbol") S0=$(ob_get SIGNAL_S0 "$symbol") S1=$(ob_get SIGNAL_S1 "$symbol")"
             fi
-            log_trade "SIGNAL $symbol $signal_dir conf=${confidence}% entry=$entry tp=$tp sl=$sl | $reasons${grid_extra}"
+            if declare -f is_trading_time_allowed >/dev/null 2>&1 && ! is_trading_time_allowed; then
+                sched_reason=$(trading_schedule_block_reason 2>/dev/null)
+                log_trade "SIGNAL $symbol $signal_dir conf=${confidence}% entry=$entry tp=$tp sl=$sl | $reasons (schedule_off ${sched_reason})${grid_extra}"
+            else
+                log_trade "SIGNAL $symbol $signal_dir conf=${confidence}% entry=$entry tp=$tp sl=$sl | $reasons${grid_extra}"
+            fi
             if [ "$DRY_RUN" = true ]; then
                 log_trade "DRY-RUN_SIGNAL $symbol $signal_dir entry=$entry (no order sent)"
             else
@@ -1184,7 +1207,15 @@ draw_and_execute() {
     done
 
     # --- Phase 2: single screen draw ---
-    _dash=("${CYAN}${BOLD}  Order Blocks Bot v5.0 — $(date '+%Y-%m-%d %H:%M:%S')  |  ${mode_label}  |  conf≥${MIN_CONFIDENCE}%  |  cooldown ${ORDER_COOLDOWN_SECONDS}s${NC}" "" \
+    local sched_hdr=""
+    if declare -f trading_schedule_summary >/dev/null 2>&1; then
+        if declare -f is_trading_time_allowed >/dev/null 2>&1 && is_trading_time_allowed; then
+            sched_hdr=" | $(trading_schedule_summary)"
+        else
+            sched_hdr=" | ⏸️ $(trading_schedule_summary)"
+        fi
+    fi
+    _dash=("${CYAN}${BOLD}  Order Blocks Bot v5.0 — $(date '+%Y-%m-%d %H:%M:%S')  |  ${mode_label}  |  conf≥${MIN_CONFIDENCE}%  |  cooldown ${ORDER_COOLDOWN_SECONDS}s${sched_hdr}${NC}" "" \
         "${CYAN}$(_dashboard_row 'Symbol' 'Status' 'Signal' 'Confidence' 'Price' 'Bid' 'Ask' '24h%' 'Spread' 'Entry' 'TP' 'SL' 'Position' 'Support' 'Resistance')${NC}" \
         "$(_dashboard_row '──────────' '────────' '────────' '──────────' '───────────' '───────────' '───────────' '────────' '────────' '───────────' '───────────' '───────────' '──────────' '───────────' '────────────')" \
         "${_dash[@]}")
@@ -1321,6 +1352,13 @@ main() {
     log "🛡️ REST SL/TP after fill: ${REST_PLACE_SL_TP} (wait ${REST_SL_TP_FILL_WAIT}s)"
     log "🔐 Lock profit: ${LOCK_PROFIT_ENABLED} (trigger ${LOCK_PROFIT_BE_PCT}% toward TP → SL at ${LOCK_PROFIT_SL_AT_PCT}% entry→TP)"
     log "⏰ Order Cooldown: ${ORDER_COOLDOWN_SECONDS}s per symbol (local fallback without API)"
+    if declare -f trading_schedule_summary >/dev/null 2>&1; then
+        if _tr_sched_enabled 2>/dev/null; then
+            log "🕐 Trading schedule (UTC): $(trading_schedule_summary)"
+        else
+            log "🕐 Trading schedule: disabled (24/7)"
+        fi
+    fi
     log "🔄 Replace stale entry LIMIT: ${REPLACE_STALE_LIMITS} (REST only; max 1 cycle / 5s per symbol)"
     log "📁 Log: $LOG_FILE | Errors: $ERROR_LOG_FILE | Trades: $TRADES_LOG_FILE"
     log_trade "READY bot=order_blocks trades_log=${TRADES_LOG_FILE}"

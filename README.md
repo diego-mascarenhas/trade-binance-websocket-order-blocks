@@ -54,12 +54,29 @@ The **only entry script** in this project is `main.sh` (project root). All logic
 | `OB_GRID_SL_RANGE_RATIO` | Fraction of (R0−S0) added beyond R0 for SHORT SL | `0.382` |
 | `MIN_CONFIDENCE` | Minimum confidence to trade | `50` |
 | `ORDER_COOLDOWN` | Seconds between orders per symbol | `300` |
+| `TRADING_SCHEDULE_ENABLED` | Enforce days/hours window for **new orders** | `true` |
+| `EXECUTION_HOUR_START` / `EXECUTION_HOUR_END` | UTC hours (end **exclusive**, like trade-deepseek) | `0` / `23` |
+| `ALLOWED_DAYS` | Comma-separated 1=Mon … 7=Sun | `1,2,3,4,5,6,7` |
 | `REPLACE_STALE_LIMITS` | Cancel stale entry LIMIT orders | `true` |
 | `CLOSE_ON_OPPOSITE` | Close position when opposite OB is touched | `true` |
 
 In **hedge mode**, the bot blocks a second direction on the same symbol: any open position (LONG or SHORT leg), both entry limits at once, or a new order while the opposite-side limit is still on the book (after `REPLACE_STALE_LIMITS` cancels the old one).
 
 On startup (with API keys), the bot syncs **open positions and pending entry limits** for every symbol in `SYMBOLS`, restores local state (`ACTIVE`, direction, entry, SL/TP from Binance), and logs what it found.
+
+### Trading schedule
+
+Same rules as [trade-deepseek](mdc:../trade-deepseek/deepseek.sh): only **opening** orders are blocked outside the window. Lock profit, SL/TP on open positions, and `CLOSE_ON_OPPOSITE` still run.
+
+Example (Tue–Thu, 14:00–18:59 UTC):
+
+```env
+EXECUTION_HOUR_START=14
+EXECUTION_HOUR_END=19
+ALLOWED_DAYS=2,3,4
+```
+
+Set `TRADING_SCHEDULE_ENABLED=false` for 24/7 trading.
 
 ### TP/SL modes
 
