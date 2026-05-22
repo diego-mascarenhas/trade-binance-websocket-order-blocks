@@ -97,22 +97,117 @@ futures_position_is_significant() {
     awk -v n="$notional" -v m="$min_usd" 'BEGIN { exit (n + 0 >= m + 0) ? 0 : 1 }'
 }
 
+# Notify Telegram when position actually closed (SL/TP fill), using realized PnL from userTrades.
+futures_notify_position_exit() {
+    local symbol="$1"
+
+    if ! declare -f ob_get >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "$(ob_get_default EXIT_NOTIFIED "$symbol" "")" = "1" ]; then
+        return 0
+    fi
+
+    local direction sl tp last_price last_qty realized pnl_msg
+    direction=$(ob_get POS_DIR "$symbol")
+    sl=$(ob_get LAST_SL "$symbol")
+    tp=$(ob_get LAST_TP "$symbol")
+    [ "$direction" = "0" ] && direction=""
+    [ -z "$direction" ] && return 0
+
+    if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
+        return 0
+    fi
+
+    local resp
+    resp=$(_binance_fapi_signed_get "/fapi/v1/userTrades" "symbol=${symbol}&limit=30")
+    if ! echo "$resp" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+        return 1
+    fi
+
+    last_price=$(echo "$resp" | jq -r '
+        [.[] | select((.realizedPnl | tonumber? // 0) != 0)] | last | .price // empty' 2>/dev/null)
+    last_qty=$(echo "$resp" | jq -r '
+        [.[] | select((.realizedPnl | tonumber? // 0) != 0)] | last | .qty // empty' 2>/dev/null)
+    realized=$(echo "$resp" | jq -r '
+        [.[] | select((.realizedPnl | tonumber? // 0) != 0)] | last | .realizedPnl // empty' 2>/dev/null)
+
+    if [ -z "$last_price" ] || [ "$last_price" = "null" ]; then
+        return 1
+    fi
+
+    ob_set EXIT_NOTIFIED "$symbol" "1"
+
+    if declare -f log_trade >/dev/null 2>&1; then
+        log_trade "CLOSE $symbol $direction exit_price=$last_price qty=${last_qty:-?} realizedPnl=$realized"
+    fi
+
+    if awk -v p="$realized" 'BEGIN { exit (p + 0 > 0) ? 0 : 1 }' 2>/dev/null; then
+        pnl_msg="TAKE_PROFIT #TP @ $last_price (qty ${last_qty:-?})"
+        if [ -n "$tp" ] && [ "$tp" != "0" ]; then
+            pnl_msg="TAKE_PROFIT #TP @ $last_price (target $tp, qty ${last_qty:-?})"
+        fi
+        if declare -f send_telegram_tp >/dev/null 2>&1; then
+            send_telegram_tp "$symbol futures
+$pnl_msg"
+        fi
+        return 0
+    fi
+
+    if awk -v p="$realized" 'BEGIN { exit (p + 0 < 0) ? 0 : 1 }' 2>/dev/null; then
+        pnl_msg="STOP_MARKET #SL @ $last_price (qty ${last_qty:-?})"
+        if [ -n "$sl" ] && [ "$sl" != "0" ]; then
+            pnl_msg="STOP_MARKET #SL @ $last_price (stop $sl, qty ${last_qty:-?})"
+        fi
+        if declare -f send_telegram_sl >/dev/null 2>&1; then
+            send_telegram_sl "$symbol futures
+$pnl_msg"
+        fi
+        return 0
+    fi
+
+    if declare -f send_telegram_bot >/dev/null 2>&1; then
+        send_telegram_bot "$symbol futures
+#CLOSED $direction @ $last_price (qty ${last_qty:-?}, PnL ~0)"
+    fi
+    return 0
+}
+
 # Clear local ACTIVE/DCA when exchange has no real position
 sync_symbol_position_flags() {
     local symbol="$1"
     if ! declare -f ob_set >/dev/null 2>&1; then
         return 0
     fi
-    local pos_info
+    local was_active=false skip_exit=0 suppress_ts pos_info
+    if [ "$(ob_get ACTIVE "$symbol")" = "true" ]; then
+        was_active=true
+    fi
+
     pos_info=$(futures_get_position "$symbol")
     if [ "$pos_info" != "none" ]; then
+        ob_set EXIT_NOTIFIED "$symbol" ""
         return 0
     fi
+
+    if [ "$was_active" = true ]; then
+        suppress_ts=$(ob_get OB_CLOSE_SUPPRESS "$symbol")
+        if [ -n "$suppress_ts" ] && [ "$suppress_ts" != "0" ]; then
+            if [ $(($(date +%s) - suppress_ts)) -lt 120 ]; then
+                skip_exit=1
+            fi
+        fi
+        if [ "$skip_exit" -eq 0 ] && declare -f futures_notify_position_exit >/dev/null 2>&1; then
+            futures_notify_position_exit "$symbol"
+        fi
+    fi
+
     ob_set ACTIVE "$symbol" "false"
     ob_set POS_DIR "$symbol" ""
     ob_set LAST_ENTRY "$symbol" ""
     ob_set LAST_TP "$symbol" ""
     ob_set LAST_SL "$symbol" ""
+    ob_set LOCK_PROFIT_STAGE "$symbol" ""
     ob_set DCA_ACTIVE "$symbol" "false"
     ob_set DCA_DIR "$symbol" ""
     ob_set DCA_SL "$symbol" ""
@@ -288,6 +383,7 @@ futures_cancel_open_entry_limits() {
             ob_set LAST_ENTRY "$symbol" ""
             ob_set LAST_TP "$symbol" ""
             ob_set LAST_SL "$symbol" ""
+            ob_set LOCK_PROFIT_STAGE "$symbol" ""
         fi
         echo "$cancelled"
         return 0
@@ -366,11 +462,13 @@ futures_close_position_market() {
             ob_set LAST_ENTRY "$symbol" ""
             ob_set LAST_TP "$symbol" ""
             ob_set LAST_SL "$symbol" ""
+            ob_set LOCK_PROFIT_STAGE "$symbol" ""
             ob_set DCA_ACTIVE "$symbol" "false"
             ob_set DCA_DIR "$symbol" ""
             ob_set DCA_SL "$symbol" ""
             ob_set DCA_TP "$symbol" ""
             ob_set OB_CLOSE_SUPPRESS "$symbol" ""
+            ob_set EXIT_NOTIFIED "$symbol" "1"
         fi
         if declare -f send_telegram_position >/dev/null 2>&1; then
             send_telegram_position "$close_dir" "$symbol futures
@@ -807,14 +905,7 @@ futures_place_sl_tp_after_entry() {
         fi
     fi
 
-    if [ "$sl_ok" -eq 0 ] && declare -f send_telegram_sl >/dev/null 2>&1; then
-        send_telegram_sl "$symbol futures
-STOP_MARKET #SL @ $sl (qty $fill_qty)"
-    fi
-    if [ "$tp_ok" -eq 0 ] && declare -f send_telegram_tp >/dev/null 2>&1; then
-        send_telegram_tp "$symbol futures
-TAKE_PROFIT #TP @ $tp (qty $fill_qty)"
-    fi
+    # SL/TP Telegram is sent only on actual fill (futures_notify_position_exit), not when orders are placed.
     if [ "$sl_ok" -eq 0 ] || [ "$tp_ok" -eq 0 ]; then
         return 0
     fi

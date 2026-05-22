@@ -50,6 +50,10 @@ The **only entry script** in this project is `main.sh` (project root). All logic
 | `ORDER_COOLDOWN` | Seconds between orders per symbol | `300` |
 | `REPLACE_STALE_LIMITS` | Cancel stale entry LIMIT orders | `true` |
 | `CLOSE_ON_OPPOSITE` | Close position when opposite OB is touched | `true` |
+| `LOCK_PROFIT_ENABLED` | Move SL toward break-even as price nears TP (REST only) | `true` |
+| `LOCK_PROFIT_BE_PCT` | % of entry→TP distance before SL moves to break-even | `70` |
+| `LOCK_PROFIT_BUFFER_PCT` | % buffer above/below entry at break-even | `0.05` |
+| `LOCK_PROFIT_STAGE2_PCT` | Optional: % toward TP to lock partial profit (`0` = off) | `0` |
 
 Logs are written to `logs/bot.log`, `logs/errors.log`, and `logs/trades.log` (the `logs/` folder is created on startup).
 
@@ -62,7 +66,7 @@ The bot should run on a machine that stays online (VPS or dedicated server). If 
 ```
 trade-binance-websocket-order-blocks/
 ├── main.sh               # Entry script (run this)
-├── lib/                  # Shared libraries (Binance, OB state, guards)
+├── lib/                  # Shared libraries (Binance, OB state, guards, lock profit)
 ├── logs/                 # Runtime logs (gitignored)
 ├── .env.example
 └── README.md

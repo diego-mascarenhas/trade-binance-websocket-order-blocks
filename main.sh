@@ -48,6 +48,10 @@ if [ -f "$SCRIPT_DIR/lib/binance_order_guard.sh" ]; then
     # shellcheck source=lib/binance_order_guard.sh
     source "$SCRIPT_DIR/lib/binance_order_guard.sh"
 fi
+if [ -f "$SCRIPT_DIR/lib/binance_lock_profit.sh" ]; then
+    # shellcheck source=lib/binance_lock_profit.sh
+    source "$SCRIPT_DIR/lib/binance_lock_profit.sh"
+fi
 
 if [ -f .env ]; then
     source .env
@@ -96,6 +100,13 @@ REST_SL_TP_POLL_INTERVAL="${REST_SL_TP_POLL_INTERVAL:-2}"
 CLOSE_ON_OPPOSITE="${CLOSE_ON_OPPOSITE:-true}"
 ZONE_UPPER_PCT="${ZONE_UPPER_PCT:-75}"
 ZONE_LOWER_PCT="${ZONE_LOWER_PCT:-25}"
+
+# Lock profit: move SL toward break-even as price advances toward TP (TP unchanged)
+LOCK_PROFIT_ENABLED="${LOCK_PROFIT_ENABLED:-true}"
+LOCK_PROFIT_BE_PCT="${LOCK_PROFIT_BE_PCT:-70}"
+LOCK_PROFIT_BUFFER_PCT="${LOCK_PROFIT_BUFFER_PCT:-0.05}"
+LOCK_PROFIT_STAGE2_PCT="${LOCK_PROFIT_STAGE2_PCT:-0}"
+LOCK_PROFIT_LOCK_RATIO="${LOCK_PROFIT_LOCK_RATIO:-0.5}"
 
 # Binance API
 BINANCE_API_KEY="${BINANCE_API_KEY:-}"
@@ -195,7 +206,7 @@ send_telegram() {
     fi
 }
 
-# Telegram style: 🍏 LONG, 🍎 SHORT, 🥳 TP, 😢 SL, 🤖 bot lifecycle
+# Telegram style: 🍏 LONG, 🍎 SHORT, 🥳 TP fill (profit), 😢 SL fill (loss), 🤖 bot lifecycle
 telegram_emoji_position() {
     case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
         long) printf '%s' '🍏' ;;
@@ -381,6 +392,7 @@ Entry: $entry | TP: $tp | SL: $sl | Qty: $quantity"
         ob_set LAST_ENTRY "$symbol" "$entry"
         ob_set LAST_TP "$symbol" "$tp"
         ob_set LAST_SL "$symbol" "$sl"
+        ob_set EXIT_NOTIFIED "$symbol" ""
 
         if declare -f futures_place_sl_tp_after_entry >/dev/null 2>&1; then
             (
@@ -456,6 +468,7 @@ Entry: $entry | TP: $tp | SL: $sl"
         ob_set LAST_ENTRY "$symbol" "$entry"
         ob_set LAST_TP "$symbol" "$tp"
         ob_set LAST_SL "$symbol" "$sl"
+        ob_set EXIT_NOTIFIED "$symbol" ""
     else
         log_error "Order failed: $response"
         log_trade "FAILED OPEN $symbol $direction entry=$entry mode=FINANDY response=$(echo "$response" | tr -d '\n')"
@@ -524,6 +537,7 @@ ob_replace_stale_entry_limits() {
     ob_set LAST_ENTRY "$symbol" ""
     ob_set LAST_TP "$symbol" ""
     ob_set LAST_SL "$symbol" ""
+    ob_set LOCK_PROFIT_STAGE "$symbol" ""
     [ -n "$log_fn" ] && $log_fn "🔄 $symbol: new $direction @ $entry — replaced unfilled entry limit(s)"
     return 0
 }
@@ -1163,6 +1177,15 @@ run_cycle() {
     
     update_24h_changes
     hydrate_missing_symbols
+
+    if declare -f futures_try_lock_profit >/dev/null 2>&1; then
+        local _sym _lp_price
+        for _sym in "${SYMBOL_ARRAY[@]}"; do
+            _lp_price=$(ob_get PRICE "$_sym")
+            futures_try_lock_profit "$_sym" "$_lp_price" log
+        done
+    fi
+
     draw_and_execute
 }
 
