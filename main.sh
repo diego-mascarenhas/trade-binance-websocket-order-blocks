@@ -149,12 +149,35 @@ NC='\033[0m'
 # FUNCTIONS
 # ============================================
 
+# Ring buffer for dashboard footer (logs never print to stdout — avoids overlapping the table)
+LAST_LOG_EVENT=""
+declare -a _LOG_RING=()
+_LOG_RING_MAX=2
+
+_log_push_event() {
+    local short="$1"
+    LAST_LOG_EVENT="$short"
+    _LOG_RING+=("$short")
+    while [ "${#_LOG_RING[@]}" -gt "$_LOG_RING_MAX" ]; do
+        _LOG_RING=("${_LOG_RING[@]:1}")
+    done
+}
+
 log() {
-    echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    local line="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo -e "$line" >> "$LOG_FILE"
+    _log_push_event "$1"
+    # Optional: LOG_TO_STDERR=1 mirrors events to stderr (not stdout)
+    if [ "${LOG_TO_STDERR:-0}" = "1" ]; then
+        echo -e "$line" >&2
+    fi
 }
 
 log_error() {
-    echo -e "${RED}[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1${NC}" | tee -a "$ERROR_LOG_FILE"
+    local line="[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1"
+    echo -e "$line" >> "$ERROR_LOG_FILE"
+    _log_push_event "ERROR: $1"
+    echo -e "${RED}${line}${NC}" >&2
 }
 
 send_telegram() {
@@ -320,6 +343,8 @@ send_order_binance_rest() {
         ob_set ACTIVE_TS "$symbol" "$(date +%s)"
         ob_set POS_DIR "$symbol" "$direction"
         ob_set LAST_ENTRY "$symbol" "$entry"
+        ob_set LAST_TP "$symbol" "$tp"
+        ob_set LAST_SL "$symbol" "$sl"
 
         if declare -f futures_place_sl_tp_after_entry >/dev/null 2>&1; then
             (
@@ -391,6 +416,8 @@ EOF
         ob_set ACTIVE_TS "$symbol" "$(date +%s)"
         ob_set POS_DIR "$symbol" "$direction"
         ob_set LAST_ENTRY "$symbol" "$entry"
+        ob_set LAST_TP "$symbol" "$tp"
+        ob_set LAST_SL "$symbol" "$sl"
     else
         log_error "Order failed: $response"
         log_trade "FAILED OPEN $symbol $direction entry=$entry mode=FINANDY response=$(echo "$response" | tr -d '\n')"
@@ -457,6 +484,8 @@ ob_replace_stale_entry_limits() {
     ob_set ACTIVE "$symbol" "false"
     ob_set POS_DIR "$symbol" ""
     ob_set LAST_ENTRY "$symbol" ""
+    ob_set LAST_TP "$symbol" ""
+    ob_set LAST_SL "$symbol" ""
     [ -n "$log_fn" ] && $log_fn "🔄 $symbol: new $direction @ $entry — replaced unfilled entry limit(s)"
     return 0
 }
@@ -490,14 +519,14 @@ send_order() {
     ob_replace_stale_entry_limits "$symbol" "$direction" "$entry" log || replace_rc=$?
     if [ "$replace_rc" -eq 2 ]; then
         log_trade "SKIP_ORDER $symbol $direction entry=$entry reason=limit_already_at_price"
-        echo -e "  ${YELLOW}⏸️ Limit already at $entry — skipping${NC}"
+        log "⏸️ Limit already at $entry — skipping ($symbol)"
         return 0
     fi
     
     if declare -f can_place_new_order >/dev/null 2>&1; then
         if ! can_place_new_order "$symbol" "$direction" "$entry" log; then
             log_trade "SKIP_ORDER $symbol $direction entry=$entry reason=guard_blocked"
-            echo -e "  ${YELLOW}⏸️ Order skipped (position or duplicate limit)${NC}"
+            log "⏸️ Order skipped (position or duplicate limit) — $symbol"
             return 0
         fi
     else
@@ -506,7 +535,7 @@ send_order() {
         if [ "$position_status" = "active" ]; then
             log "⏸️ Position already active for $symbol - skipping order"
             log_trade "SKIP_ORDER $symbol $direction entry=$entry reason=position_active"
-            echo -e "  ${YELLOW}⏸️ Position already open - skipping${NC}"
+            log "⏸️ Position already open - skipping ($symbol)"
             return 0
         fi
     fi
@@ -838,32 +867,81 @@ update_24h_changes() {
 # DISPLAY AND EXECUTE
 # ============================================
 
+# Status column: OK | WATCH | NEUTRAL | CLOSE
+_dashboard_status_label() {
+    local signal="$1" confidence="$2" min_conf="$3" closed="$4"
+    if [ "$closed" = "1" ]; then
+        printf '%s' "CLOSE"
+        return 0
+    fi
+    if [ "$signal" = "NEUTRAL" ] || [ "$signal" = "NEUT" ]; then
+        printf '%s' "NEUTRAL"
+        return 0
+    fi
+    if [ "$confidence" -ge "$min_conf" ] 2>/dev/null; then
+        printf '%s' "OK"
+        return 0
+    fi
+    printf '%s' "WATCH"
+}
+
+_dashboard_row() {
+    printf '%-10s %-8s %-8s %-10s %-11s %-11s %-11s %-8s %-8s %-11s %-11s %-11s %-10s %-11s %-12s' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12}" "${13}" "${14}" "${15}"
+}
+
+_dashboard_truncate() {
+    local text="$1" max="${2:-20}"
+    [ -z "$text" ] && printf '%s' "--" && return 0
+    if [ "${#text}" -gt "$max" ]; then
+        printf '%s' "${text:0:$((max - 1))}…"
+    else
+        printf '%s' "$text"
+    fi
+}
+
+# Row colors: OK=green WATCH=yellow CLOSE=magenta OPEN position=red NEUT=white
+_dashboard_color_row() {
+    local stat="$2" pos="${13}" plain color
+    plain=$(_dashboard_row "$@")
+    if [ "$pos" = "OPEN" ]; then
+        color="$RED"
+    else
+        case "$stat" in
+            OK) color="$GREEN" ;;
+            WATCH) color="$YELLOW" ;;
+            CLOSE) color="$MAGENTA" ;;
+            *) color="$WHITE" ;;
+        esac
+    fi
+    printf '%b%s%b' "$color" "$plain" "$NC"
+}
+
 draw_and_execute() {
-    screen_refresh
-    echo -e "${CYAN}${BOLD}════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${CYAN}${BOLD}  Order Blocks Bot v5.0 — multi-symbol — $(date '+%Y-%m-%d %H:%M:%S')${NC}"
-    echo -e "${CYAN}${BOLD}════════════════════════════════════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e "${YELLOW}  Mode: $([ "$DRY_RUN" = true ] && echo "DRY-RUN" || echo "LIVE") | Min Confidence: ${MIN_CONFIDENCE}% | Cooldown: ${ORDER_COOLDOWN_SECONDS}s${NC}"
-    echo -e "${CYAN}────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
-    echo ""
-    
+    local mode_label="LIVE"
+    [ "$DRY_RUN" = true ] && mode_label="DRY-RUN"
+    local -a _dash=()
+    local symbol price best_bid best_ask support resistance change spread
+    local signal_data signal confidence entry reasons sl tp
+    local status_label pos_col closed_flag change_disp signal_dir reason_short
+    local evt line
+    local -a _dash_notes=()
+
+    # --- Phase 1: update state, trade, build rows (no terminal output) ---
     for symbol in "${SYMBOL_ARRAY[@]}"; do
-        local price best_bid best_ask support resistance change
         price=$(ob_get PRICE "$symbol")
         best_bid=$(ob_get BID "$symbol")
         best_ask=$(ob_get ASK "$symbol")
         support=$(ob_get SUPPORT "$symbol")
         resistance=$(ob_get RESISTANCE "$symbol")
         change=$(ob_get CHANGE24 "$symbol")
-        
-        # Check if position is active for display
-        local position_active=""
+
+        pos_col="--"
         if [ "$(ob_get ACTIVE "$symbol")" = "true" ]; then
-            position_active=" ${RED}[POSITION ACTIVE]${NC}"
+            pos_col="OPEN"
         fi
-        
-        # Calculate spread
-        local spread=0
+
+        spread=0
         if [ "$best_bid" != "0" ] && [ "$best_ask" != "0" ] && [ "$best_bid" != "null" ] && [ "$best_ask" != "null" ]; then
             spread=$(echo "$best_ask - $best_bid" | bc -l 2>/dev/null)
         fi
@@ -872,60 +950,109 @@ draw_and_execute() {
             sync_symbol_position_flags "$symbol"
         fi
 
-        # Close only if a real position exists (not dust); opposite OB touch
+        closed_flag=0
         if declare -f try_close_on_opposite_ob >/dev/null 2>&1 \
             && try_close_on_opposite_ob "$symbol" "$price" "$ZONE_UPPER_PCT" "$ZONE_LOWER_PCT" log; then
-            echo -e "   ${MAGENTA}🔒 Closed (or closing) — opposite OB touch${NC}"
+            closed_flag=1
+            pos_col="CLOSE"
+            log "🔒 $symbol — closed (or closing) on opposite OB touch"
         fi
-        
-        # Get signal
-        local signal_data=$(determine_signal "$symbol" "$price" "$change")
-        local signal=$(echo "$signal_data" | cut -d'|' -f1)
-        local confidence=$(echo "$signal_data" | cut -d'|' -f2)
-        local entry=$(echo "$signal_data" | cut -d'|' -f3)
-        local reasons=$(echo "$signal_data" | cut -d'|' -f4)
-        
-        # Calculate TP/SL (skip when entry is invalid — e.g. NEUTRAL with entry=0)
-        local sl="0" tp="0" sl_pct="$SL_PERCENT" tp_pct="$TP_PERCENT"
-        if [ -n "$entry" ] && (( $(echo "$entry > 0" | bc -l 2>/dev/null) )); then
-            local tp_sl_data=$(calculate_tp_sl "$entry" "$signal" "$change" "$spread" "$symbol")
+
+        signal_data=$(determine_signal "$symbol" "$price" "$change")
+        signal=$(echo "$signal_data" | cut -d'|' -f1)
+        confidence=$(echo "$signal_data" | cut -d'|' -f2)
+        entry=$(echo "$signal_data" | cut -d'|' -f3)
+        reasons=$(echo "$signal_data" | cut -d'|' -f4)
+
+        sl="--"
+        tp="--"
+        if [ "$signal" != "NEUTRAL" ] && [ -n "$entry" ] && (( $(echo "$entry > 0" | bc -l 2>/dev/null) )); then
+            local tp_sl_data
+            tp_sl_data=$(calculate_tp_sl "$entry" "$signal" "$change" "$spread" "$symbol")
             sl=$(echo "$tp_sl_data" | cut -d'|' -f1)
             tp=$(echo "$tp_sl_data" | cut -d'|' -f2)
-            sl_pct=$(echo "$tp_sl_data" | cut -d'|' -f3)
-            tp_pct=$(echo "$tp_sl_data" | cut -d'|' -f4)
-        fi
-        
-        # Display
-        if [ "$signal" != "NEUTRAL" ] && [ "$confidence" -ge "$MIN_CONFIDENCE" ]; then
-            echo -e "${GREEN}${BOLD}▶ $symbol - CONFIRMED ${signal} (${confidence}%)${position_active}${NC}"
-            echo -e "   Entry: $entry | TP: $tp (${tp_pct}%) | SL: $sl (${sl_pct}%)"
-            echo -e "   Reasons: $reasons"
-            log_trade "SIGNAL $symbol $signal conf=${confidence}% entry=$entry tp=$tp sl=$sl | $reasons"
-            
-            # Execute order
-            if [ "$DRY_RUN" = true ]; then
-                log_trade "DRY-RUN_SIGNAL $symbol $signal entry=$entry (no order sent)"
-            else
-                send_order "$symbol" "$signal" "$entry" "$sl" "$tp"
-            fi
-            
-        elif [ "$signal" != "NEUTRAL" ]; then
-            log_trade "WATCH $symbol $signal conf=${confidence}% need=${MIN_CONFIDENCE}% entry=$entry | $reasons"
-            echo -e "${YELLOW}▶ $symbol - WATCH ${signal} (${confidence}%) - needs ${MIN_CONFIDENCE}%${position_active}${NC}"
-            echo -e "   Entry: $entry | TP: $tp | SL: $sl"
-            echo -e "   Reasons: $reasons"
         else
-            echo -e "${WHITE}▶ $symbol - NEUTRAL${position_active}${NC}"
+            entry="--"
         fi
-        
-        echo -e "   Price: $price | 24h: ${change}% | Spread: $spread"
-        echo -e "   Best Bid: $best_bid | Best Ask: $best_ask"
-        echo -e "   Support: $support | Resistance: $resistance"
-        echo ""
+
+        signal_dir="$signal"
+        if [ "$pos_col" = "OPEN" ] || [ "$pos_col" = "CLOSE" ]; then
+            local stored_entry stored_tp stored_sl stored_dir
+            stored_entry=$(ob_get LAST_ENTRY "$symbol")
+            stored_tp=$(ob_get LAST_TP "$symbol")
+            stored_sl=$(ob_get LAST_SL "$symbol")
+            stored_dir=$(ob_get POS_DIR "$symbol")
+            if [ -n "$stored_dir" ] && [ "$stored_dir" != "0" ]; then
+                signal_dir="$stored_dir"
+            fi
+            if [ -n "$stored_entry" ] && [ "$stored_entry" != "0" ]; then
+                entry="$stored_entry"
+            fi
+            if [ -n "$stored_tp" ] && [ "$stored_tp" != "0" ]; then
+                tp="$stored_tp"
+            fi
+            if [ -n "$stored_sl" ] && [ "$stored_sl" != "0" ]; then
+                sl="$stored_sl"
+            fi
+        fi
+
+        status_label=$(_dashboard_status_label "$signal" "$confidence" "$MIN_CONFIDENCE" "$closed_flag")
+        if [ "$pos_col" = "OPEN" ]; then
+            status_label="OPEN"
+        fi
+
+        change_disp="$change"
+        if [ -n "$change" ] && [ "$change" != "0" ]; then
+            case "$change" in
+                *%*) ;;
+                -*) change_disp="${change}%" ;;
+                *) change_disp="+${change}%" ;;
+            esac
+        fi
+
+        if [ "$signal_dir" != "NEUTRAL" ] && [ "$confidence" -ge "$MIN_CONFIDENCE" ] && [ "$closed_flag" -eq 0 ]; then
+            log_trade "SIGNAL $symbol $signal_dir conf=${confidence}% entry=$entry tp=$tp sl=$sl | $reasons"
+            if [ "$DRY_RUN" = true ]; then
+                log_trade "DRY-RUN_SIGNAL $symbol $signal_dir entry=$entry (no order sent)"
+            else
+                send_order "$symbol" "$signal_dir" "$entry" "$sl" "$tp"
+            fi
+        elif [ "$signal_dir" != "NEUTRAL" ]; then
+            log_trade "WATCH $symbol $signal_dir conf=${confidence}% need=${MIN_CONFIDENCE}% entry=$entry | $reasons"
+        fi
+
+        reason_short=$(_dashboard_truncate "$reasons" 18)
+        _dash+=("$(_dashboard_color_row "$symbol" "$status_label" "$signal_dir" "$confidence" \
+            "$price" "$best_bid" "$best_ask" "$change_disp" "$spread" "$entry" "$tp" "$sl" "$pos_col" "$support" "$resistance")")
+
+        if [ "$signal_dir" != "NEUTRAL" ] && [ -n "$reasons" ] && [ "$reasons" != "0" ]; then
+            _dash_notes+=("${YELLOW}  ▶ ${symbol}${NC} ${reasons}")
+        fi
     done
-    
-    echo -e "${CYAN}────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
-    echo -e "${YELLOW}⏰ $(date '+%H:%M:%S') | Cycle every 5s | Ctrl+C to exit${NC}"
+
+    # --- Phase 2: single screen draw ---
+    _dash=("${CYAN}${BOLD}  Order Blocks Bot v5.0 — $(date '+%Y-%m-%d %H:%M:%S')  |  ${mode_label}  |  conf≥${MIN_CONFIDENCE}%  |  cooldown ${ORDER_COOLDOWN_SECONDS}s${NC}" "" \
+        "${CYAN}$(_dashboard_row 'Symbol' 'Status' 'Signal' 'Confidence' 'Price' 'Bid' 'Ask' '24h%' 'Spread' 'Entry' 'TP' 'SL' 'Position' 'Support' 'Resistance')${NC}" \
+        "$(_dashboard_row '──────────' '────────' '────────' '──────────' '───────────' '───────────' '───────────' '────────' '────────' '───────────' '───────────' '───────────' '──────────' '───────────' '────────────')" \
+        "${_dash[@]}")
+
+    if [ "${#_dash_notes[@]}" -gt 0 ]; then
+        _dash+=("" "${CYAN}Signals:${NC}")
+        _dash+=("${_dash_notes[@]}")
+    fi
+
+    _dash+=("" "${YELLOW}Logs: tail -f logs/bot.log  |  trades: logs/trades.log  |  cycle 5s  |  Ctrl+C exit${NC}")
+
+    if [ "${#_LOG_RING[@]}" -gt 0 ]; then
+        _dash+=("${CYAN}Recent:${NC}")
+        for evt in "${_LOG_RING[@]}"; do
+            line="$evt"
+            [ "${#line}" -gt 88 ] && line="${line:0:85}..."
+            _dash+=("  $line")
+        done
+    fi
+
+    dashboard_flush "${_dash[@]}"
 }
 
 # ============================================

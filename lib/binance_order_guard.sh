@@ -111,6 +111,8 @@ sync_symbol_position_flags() {
     ob_set ACTIVE "$symbol" "false"
     ob_set POS_DIR "$symbol" ""
     ob_set LAST_ENTRY "$symbol" ""
+    ob_set LAST_TP "$symbol" ""
+    ob_set LAST_SL "$symbol" ""
     ob_set DCA_ACTIVE "$symbol" "false"
     ob_set DCA_DIR "$symbol" ""
     ob_set DCA_SL "$symbol" ""
@@ -284,6 +286,8 @@ futures_cancel_open_entry_limits() {
             ob_set ACTIVE "$symbol" "false"
             ob_set POS_DIR "$symbol" ""
             ob_set LAST_ENTRY "$symbol" ""
+            ob_set LAST_TP "$symbol" ""
+            ob_set LAST_SL "$symbol" ""
         fi
         echo "$cancelled"
         return 0
@@ -360,6 +364,8 @@ futures_close_position_market() {
             ob_set ACTIVE "$symbol" "false"
             ob_set POS_DIR "$symbol" ""
             ob_set LAST_ENTRY "$symbol" ""
+            ob_set LAST_TP "$symbol" ""
+            ob_set LAST_SL "$symbol" ""
             ob_set DCA_ACTIVE "$symbol" "false"
             ob_set DCA_DIR "$symbol" ""
             ob_set DCA_SL "$symbol" ""

@@ -38,7 +38,7 @@ detect_binance_position_mode() {
                 return 0
                 ;;
             *)
-                echo "❌ Invalid BINANCE_POSITION_MODE: $BINANCE_POSITION_MODE (use hedge or oneway)"
+                echo "❌ Invalid BINANCE_POSITION_MODE: $BINANCE_POSITION_MODE (use hedge or oneway)" >&2
                 return 1
                 ;;
         esac
@@ -61,7 +61,7 @@ detect_binance_position_mode() {
     elif [ "$dual" = "false" ]; then
         BINANCE_HEDGE_MODE=false
     else
-        echo "⚠️  Could not detect position mode: $resp"
+        echo "⚠️  Could not detect position mode: $resp" >&2
         BINANCE_HEDGE_MODE=false
         return 1
     fi
