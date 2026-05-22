@@ -728,12 +728,19 @@ determine_signal() {
     local current_price="$2"
     local change_24h="$3"
     
-    # Block new signals only when there is a real position (not a pending entry LIMIT)
+    # Block when any significant position exists (both legs in hedge mode)
     if declare -f futures_has_open_position >/dev/null 2>&1 \
         && futures_has_open_position "$symbol"; then
         echo "NEUTRAL|0|0|Position already open"
         return
     fi
+
+    if declare -f futures_has_conflicting_entry_limits >/dev/null 2>&1 \
+        && futures_has_conflicting_entry_limits "$symbol"; then
+        echo "NEUTRAL|0|0|Conflicting entry limits"
+        return
+    fi
+
     local replace_stale=false
     case "$(echo "${REPLACE_STALE_LIMITS}" | tr '[:upper:]' '[:lower:]')" in
         true|1|yes|on) replace_stale=true ;;

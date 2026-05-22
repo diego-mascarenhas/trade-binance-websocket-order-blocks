@@ -551,11 +551,32 @@ try_close_on_opposite_ob() {
     return 1
 }
 
-# Returns 0 if futures position size is significant (not dust)
+# Returns 0 if any entry LIMIT exists on LONG or SHORT side (any price)
+futures_has_open_entry_limit_any() {
+    local symbol="$1"
+    futures_has_open_limit_same_side "$symbol" "LONG" \
+        || futures_has_open_limit_same_side "$symbol" "SHORT"
+}
+
+# Returns 0 if both LONG and SHORT entry limits are on the book (hedge trap)
+futures_has_conflicting_entry_limits() {
+    local symbol="$1"
+    futures_has_open_limit_same_side "$symbol" "LONG" \
+        && futures_has_open_limit_same_side "$symbol" "SHORT"
+}
+
+# Returns 0 if futures position size is significant (not dust) on any leg
 futures_has_open_position() {
     local symbol="$1"
-    local pos_info
+    local pos_info pos_long pos_short
     if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
+        return 1
+    fi
+    if declare -f binance_is_hedge_mode >/dev/null 2>&1 && binance_is_hedge_mode; then
+        pos_long=$(futures_get_position "$symbol" "LONG")
+        pos_short=$(futures_get_position "$symbol" "SHORT")
+        [ "$pos_long" != "none" ] && return 0
+        [ "$pos_short" != "none" ] && return 0
         return 1
     fi
     pos_info=$(futures_get_position "$symbol")
@@ -664,6 +685,18 @@ can_place_new_order() {
 
     if futures_has_open_position "$symbol"; then
         [ -n "$log_fn" ] && $log_fn "⏸️ $symbol: open position on Binance — skipping order"
+        return 1
+    fi
+
+    if futures_has_conflicting_entry_limits "$symbol"; then
+        [ -n "$log_fn" ] && $log_fn "⏸️ $symbol: LONG and SHORT entry limits on book — skipping order"
+        return 1
+    fi
+
+    local opposite_dir
+    opposite_dir=$([ "$(echo "$direction" | tr '[:upper:]' '[:lower:]')" = "long" ] && echo "SHORT" || echo "LONG")
+    if futures_has_open_limit_same_side "$symbol" "$opposite_dir"; then
+        [ -n "$log_fn" ] && $log_fn "⏸️ $symbol: pending $opposite_dir limit — cancel/replace before $direction"
         return 1
     fi
 
