@@ -372,8 +372,9 @@ futures_close_position_market() {
             ob_set DCA_TP "$symbol" ""
             ob_set OB_CLOSE_SUPPRESS "$symbol" ""
         fi
-        if declare -f send_telegram >/dev/null 2>&1; then
-            send_telegram "🔒 CLOSE $symbol $close_dir — opposite order book (qty $quantity)"
+        if declare -f send_telegram_position >/dev/null 2>&1; then
+            send_telegram_position "$close_dir" "$symbol futures
+#CLOSED $close_dir — opposite order book (qty $quantity)"
         fi
         return 0
     fi
@@ -806,10 +807,15 @@ futures_place_sl_tp_after_entry() {
         fi
     fi
 
+    if [ "$sl_ok" -eq 0 ] && declare -f send_telegram_sl >/dev/null 2>&1; then
+        send_telegram_sl "$symbol futures
+STOP_MARKET #SL @ $sl (qty $fill_qty)"
+    fi
+    if [ "$tp_ok" -eq 0 ] && declare -f send_telegram_tp >/dev/null 2>&1; then
+        send_telegram_tp "$symbol futures
+TAKE_PROFIT #TP @ $tp (qty $fill_qty)"
+    fi
     if [ "$sl_ok" -eq 0 ] || [ "$tp_ok" -eq 0 ]; then
-        if declare -f send_telegram >/dev/null 2>&1; then
-            send_telegram "🛡️ $symbol $direction — SL/TP on Binance (SL:$sl TP:$tp)"
-        fi
         return 0
     fi
 

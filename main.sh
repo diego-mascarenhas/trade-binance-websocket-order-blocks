@@ -182,10 +182,44 @@ log_error() {
 
 send_telegram() {
     [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ] && return 1
-    local msg=$(echo "$1" | sed 's/\\/\\\\/g')
-    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -H "Content-Type: application/json" \
-        -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${msg}\"}" > /dev/null
+    local msg="$1"
+    if command -v jq >/dev/null 2>&1; then
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg c "$TELEGRAM_CHAT_ID" --arg t "$msg" '{chat_id: $c, text: $t}')" > /dev/null
+    else
+        msg=$(echo "$msg" | sed 's/\\/\\\\/g' | awk '{printf "%s\\n", $0}' ORS='')
+        curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\": \"${TELEGRAM_CHAT_ID}\", \"text\": \"${msg}\"}" > /dev/null
+    fi
+}
+
+# Telegram style: 🍏 LONG, 🍎 SHORT, 🥳 TP, 😢 SL, 🤖 bot lifecycle
+telegram_emoji_position() {
+    case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+        long) printf '%s' '🍏' ;;
+        short) printf '%s' '🍎' ;;
+        *) printf '%s' '🤖' ;;
+    esac
+}
+
+send_telegram_bot() {
+    send_telegram "🤖 $*"
+}
+
+send_telegram_position() {
+    local direction="$1"
+    shift
+    send_telegram "$(telegram_emoji_position "$direction") $*"
+}
+
+send_telegram_tp() {
+    send_telegram "🥳 $*"
+}
+
+send_telegram_sl() {
+    send_telegram "😢 $*"
 }
 
 # Safe division for bc (avoids "Divide by zero" on stderr)
@@ -324,7 +358,7 @@ send_order_binance_rest() {
     if [ "$DRY_RUN" = true ]; then
         log "🔍 DRY-RUN: Would execute"
         log_trade "DRY-RUN OPEN $symbol $direction entry=$entry sl=$sl tp=$tp qty=$quantity mode=REST"
-        send_telegram "🔍 DRY-RUN: $symbol $direction Entry:$entry"
+        send_telegram_bot "DRY-RUN: $symbol $direction | Entry $entry"
         return 0
     fi
     
@@ -337,7 +371,9 @@ send_order_binance_rest() {
         order_id=$(echo "$response" | jq -r '.orderId' 2>/dev/null)
         log "✅ Order executed: $symbol (orderId $order_id)"
         log_trade "OPEN $symbol $direction entry=$entry sl=$sl tp=$tp qty=$quantity mode=REST status=ok orderId=$order_id"
-        send_telegram "✅ ORDER: $symbol $direction Entry:$entry TP:$tp SL:$sl"
+        send_telegram_position "$direction" "$symbol futures
+LIMIT #OPEN $direction
+Entry: $entry | TP: $tp | SL: $sl | Qty: $quantity"
 
         ob_set ACTIVE "$symbol" "true"
         ob_set ACTIVE_TS "$symbol" "$(date +%s)"
@@ -358,7 +394,7 @@ send_order_binance_rest() {
     else
         log_error "Order failed: $response"
         log_trade "FAILED OPEN $symbol $direction entry=$entry sl=$sl tp=$tp qty=$quantity mode=REST response=$(echo "$response" | tr -d '\n')"
-        send_telegram "❌ ORDER FAILED: $symbol $direction"
+        send_telegram "❌ $symbol futures — ORDER FAILED ($direction)"
         return 1
     fi
 }
@@ -411,7 +447,9 @@ EOF
     if echo "$response" | jq -e '.code == 200 or .success == true' >/dev/null 2>&1; then
         log "✅ Order executed via Finandy"
         log_trade "OPEN $symbol $direction entry=$entry sl=$sl tp=$tp mode=FINANDY status=ok"
-        send_telegram "✅ ORDER: $symbol $direction Entry:$entry"
+        send_telegram_position "$direction" "$symbol futures
+#OPEN $direction (Finandy)
+Entry: $entry | TP: $tp | SL: $sl"
         ob_set ACTIVE "$symbol" "true"
         ob_set ACTIVE_TS "$symbol" "$(date +%s)"
         ob_set POS_DIR "$symbol" "$direction"
@@ -900,21 +938,57 @@ _dashboard_truncate() {
     fi
 }
 
-# Row colors: OK=green WATCH=yellow CLOSE=magenta OPEN position=red NEUT=white
+# Colored cell (fixed width; ANSI does not break column alignment)
+_dashboard_cell() {
+    local width="$1" color="$2" value="$3"
+    printf '%b%-*s%b' "$color" "$width" "$value" "$NC"
+}
+
+# Per-column colors: Status by state, Signal LONG/SHORT, 24h% +/- , Position OPEN/CLOSE
 _dashboard_color_row() {
-    local stat="$2" pos="${13}" plain color
-    plain=$(_dashboard_row "$@")
-    if [ "$pos" = "OPEN" ]; then
-        color="$RED"
-    else
-        case "$stat" in
-            OK) color="$GREEN" ;;
-            WATCH) color="$YELLOW" ;;
-            CLOSE) color="$MAGENTA" ;;
-            *) color="$WHITE" ;;
-        esac
-    fi
-    printf '%b%s%b' "$color" "$plain" "$NC"
+    local symbol="$1" stat="$2" sig="$3" conf="$4" price="$5" bid="$6" ask="$7"
+    local ch24="$8" spread="$9" entry="${10}" tp="${11}" sl="${12}" pos="${13}" sup="${14}" res="${15}"
+    local stat_c sig_c ch24_c pos_c
+
+    case "$stat" in
+        OK) stat_c="$GREEN" ;;
+        WATCH) stat_c="$YELLOW" ;;
+        OPEN) stat_c="$CYAN" ;;
+        CLOSE) stat_c="$MAGENTA" ;;
+        *) stat_c="$WHITE" ;;
+    esac
+
+    case "$sig" in
+        LONG) sig_c="$GREEN" ;;
+        SHORT) sig_c="$RED" ;;
+        *) sig_c="$WHITE" ;;
+    esac
+
+    ch24_c="$WHITE"
+    case "$ch24" in
+        +*) ch24_c="$GREEN" ;;
+        -*) ch24_c="$RED" ;;
+    esac
+
+    pos_c="$WHITE"
+    case "$pos" in
+        OPEN) pos_c="$RED" ;;
+        CLOSE) pos_c="$MAGENTA" ;;
+    esac
+
+    _dashboard_cell 10 "$WHITE" "$symbol"
+    printf ' '
+    _dashboard_cell 8 "$stat_c" "$stat"
+    printf ' '
+    _dashboard_cell 8 "$sig_c" "$sig"
+    printf ' '
+    _dashboard_cell 10 "$WHITE" "$conf"
+    printf ' %-11s %-11s %-11s' "$price" "$bid" "$ask"
+    printf ' '
+    _dashboard_cell 8 "$ch24_c" "$ch24"
+    printf ' %-8s %-11s %-11s %-11s ' "$spread" "$entry" "$tp" "$sl"
+    _dashboard_cell 10 "$pos_c" "$pos"
+    printf ' %-11s %-12s' "$sup" "$res"
 }
 
 draw_and_execute() {
@@ -1184,13 +1258,14 @@ main() {
         exit 1
     fi
     
-    send_telegram "🤖 Order Blocks Bot v5.0 Started - Mode: $([ "$DRY_RUN" = true ] && echo "DRY-RUN" || echo "LIVE") | Cooldown: ${ORDER_COOLDOWN_SECONDS}s"
+    send_telegram_bot "Order Blocks Bot v5.0 started
+Mode: $([ "$DRY_RUN" = true ] && echo "DRY-RUN" || echo "LIVE") | Symbols: ${SYMBOLS} | Cooldown: ${ORDER_COOLDOWN_SECONDS}s"
     
     screen_enable_alt
     connect_websocket
 }
 
-trap 'screen_disable_alt; echo -e "\n${YELLOW}👋 Shutting down...${NC}"; send_telegram "🛑 Bot Stopped"; exit 0' INT
+trap 'screen_disable_alt; echo -e "\n${YELLOW}👋 Shutting down...${NC}"; send_telegram_bot "Order Blocks Bot stopped"; exit 0' INT
 trap 'screen_disable_alt' EXIT
 
 main
