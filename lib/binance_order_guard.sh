@@ -81,6 +81,51 @@ _futures_position_notional_usd() {
     echo "${notional:-0}"
 }
 
+# Display notional: entry×qty, else qty×mark, else POSITION_SIZE_USDT. Echoes e.g. 50.00
+format_position_volume_usdt() {
+    local symbol="$1"
+    local entry="${2:-}"
+    local qty="${3:-}"
+    local vol
+
+    if [ -n "$entry" ] && _bn_is_positive "$entry" \
+        && [ -n "$qty" ] && _bn_is_positive "$qty"; then
+        vol=$(echo "scale=2; $entry * $qty / 1" | bc -l 2>/dev/null)
+    elif [ -n "$symbol" ] && [ -n "$qty" ] && _bn_is_positive "$qty"; then
+        vol=$(_futures_position_notional_usd "$symbol" "$qty")
+        vol=$(echo "scale=2; ${vol:-0} / 1" | bc -l 2>/dev/null)
+    elif [ -n "${POSITION_SIZE_USDT:-}" ] && (( $(echo "${POSITION_SIZE_USDT} > 0" | bc -l 2>/dev/null) )); then
+        vol=$(echo "scale=2; ${POSITION_SIZE_USDT} / 1" | bc -l 2>/dev/null)
+    else
+        echo "?"
+        return 0
+    fi
+    echo "${vol:-?}"
+}
+
+# Format realized PnL for Telegram (e.g. +0.32 USDT / -0.15 USDT)
+format_realized_pnl_usdt() {
+    local realized="$1"
+    local formatted
+
+    if [ -z "$realized" ] || [ "$realized" = "null" ]; then
+        echo "PnL ?"
+        return 0
+    fi
+    formatted=$(printf '%.2f' "$realized" 2>/dev/null)
+    if [ -z "$formatted" ]; then
+        echo "PnL ?"
+        return 0
+    fi
+    if awk -v p="$realized" 'BEGIN { exit (p + 0 > 0) ? 0 : 1 }' 2>/dev/null; then
+        echo "+${formatted} USDT"
+    elif awk -v p="$realized" 'BEGIN { exit (p + 0 < 0) ? 0 : 1 }' 2>/dev/null; then
+        echo "${formatted} USDT"
+    else
+        echo "0.00 USDT"
+    fi
+}
+
 # return 0 if position size is worth tracking (not dust)
 futures_position_is_significant() {
     local symbol="$1"
@@ -108,7 +153,7 @@ futures_notify_position_exit() {
         return 0
     fi
 
-    local direction sl tp last_price last_qty realized pnl_msg
+    local direction sl tp last_price last_qty realized pnl_msg pnl_label
     direction=$(ob_get POS_DIR "$symbol")
     sl=$(ob_get LAST_SL "$symbol")
     tp=$(ob_get LAST_TP "$symbol")
@@ -138,14 +183,16 @@ futures_notify_position_exit() {
 
     ob_set EXIT_NOTIFIED "$symbol" "1"
 
+    pnl_label=$(format_realized_pnl_usdt "$realized")
+
     if declare -f log_trade >/dev/null 2>&1; then
-        log_trade "CLOSE $symbol $direction exit_price=$last_price qty=${last_qty:-?} realizedPnl=$realized"
+        log_trade "CLOSE $symbol $direction exit_price=$last_price realizedPnl=$realized"
     fi
 
     if awk -v p="$realized" 'BEGIN { exit (p + 0 > 0) ? 0 : 1 }' 2>/dev/null; then
-        pnl_msg="TAKE_PROFIT #TP @ $last_price (qty ${last_qty:-?})"
+        pnl_msg="TAKE_PROFIT #TP @ $last_price | PnL: ${pnl_label}"
         if [ -n "$tp" ] && [ "$tp" != "0" ]; then
-            pnl_msg="TAKE_PROFIT #TP @ $last_price (target $tp, qty ${last_qty:-?})"
+            pnl_msg="TAKE_PROFIT #TP @ $last_price (TP $tp) | PnL: ${pnl_label}"
         fi
         if declare -f send_telegram_tp >/dev/null 2>&1; then
             send_telegram_tp "$symbol futures
@@ -155,9 +202,9 @@ $pnl_msg"
     fi
 
     if awk -v p="$realized" 'BEGIN { exit (p + 0 < 0) ? 0 : 1 }' 2>/dev/null; then
-        pnl_msg="STOP_MARKET #SL @ $last_price (qty ${last_qty:-?})"
+        pnl_msg="STOP_MARKET #SL @ $last_price | PnL: ${pnl_label}"
         if [ -n "$sl" ] && [ "$sl" != "0" ]; then
-            pnl_msg="STOP_MARKET #SL @ $last_price (stop $sl, qty ${last_qty:-?})"
+            pnl_msg="STOP_MARKET #SL @ $last_price (SL $sl) | PnL: ${pnl_label}"
         fi
         if declare -f send_telegram_sl >/dev/null 2>&1; then
             send_telegram_sl "$symbol futures
@@ -168,7 +215,7 @@ $pnl_msg"
 
     if declare -f send_telegram_bot >/dev/null 2>&1; then
         send_telegram_bot "$symbol futures
-#CLOSED $direction @ $last_price (qty ${last_qty:-?}, PnL ~0)"
+#CLOSED $direction @ $last_price | PnL: ${pnl_label}"
     fi
     return 0
 }
@@ -376,7 +423,7 @@ sync_startup_configured_positions() {
             entry=$(ob_get LAST_ENTRY "$sym")
             sl=$(ob_get LAST_SL "$sym")
             tp=$(ob_get LAST_TP "$sym")
-            [ -n "$log_fn" ] && $log_fn "📍 $sym: open ${dir} position qty=${qty} entry=${entry:-?} sl=${sl:-?} tp=${tp:-?}"
+            [ -n "$log_fn" ] && $log_fn "📍 $sym: open ${dir} position vol_usdt=$(format_position_volume_usdt "$sym" "$entry" "$qty") entry=${entry:-?} sl=${sl:-?} tp=${tp:-?}"
             found=$((found + 1))
             continue
         fi
@@ -674,9 +721,9 @@ futures_close_position_market() {
     fi
 
     if [ "$dry_run" = true ]; then
-        [ -n "$log_fn" ] && $log_fn "🔍 DRY-RUN: Would CLOSE $close_dir $symbol qty=$quantity (opposite OB)"
+        [ -n "$log_fn" ] && $log_fn "🔍 DRY-RUN: Would CLOSE $close_dir $symbol vol_usdt=$(format_position_volume_usdt "$symbol" "$(ob_get LAST_ENTRY "$symbol")" "$quantity") (opposite OB)"
         if declare -f log_trade >/dev/null 2>&1; then
-            log_trade "DRY-RUN CLOSE $symbol $close_dir qty=$quantity reason=opposite_ob mode=REST"
+            log_trade "DRY-RUN CLOSE $symbol $close_dir vol_usdt=$(format_position_volume_usdt "$symbol" "$(ob_get LAST_ENTRY "$symbol")" "$quantity") reason=opposite_ob mode=REST"
         fi
         return 0
     fi
@@ -703,9 +750,9 @@ futures_close_position_market() {
     response=$(_binance_fapi_signed_post "/fapi/v1/order" "$query_string")
 
     if echo "$response" | jq -e '.orderId' >/dev/null 2>&1; then
-        [ -n "$log_fn" ] && $log_fn "✅ Closed $close_dir position on $symbol (qty $quantity) — opposite OB touch"
+        [ -n "$log_fn" ] && $log_fn "✅ Closed $close_dir position on $symbol (Vol $(format_position_volume_usdt "$symbol" "$(ob_get LAST_ENTRY "$symbol")" "$quantity") USDT) — opposite OB touch"
         if declare -f log_trade >/dev/null 2>&1; then
-            log_trade "CLOSE $symbol $close_dir qty=$quantity reason=opposite_ob mode=REST status=ok"
+            log_trade "CLOSE $symbol $close_dir vol_usdt=$(format_position_volume_usdt "$symbol" "$(ob_get LAST_ENTRY "$symbol")" "$quantity") reason=opposite_ob mode=REST status=ok"
         fi
         if declare -f ob_set >/dev/null 2>&1; then
             ob_set ACTIVE "$symbol" "false"
@@ -722,15 +769,17 @@ futures_close_position_market() {
             ob_set EXIT_NOTIFIED "$symbol" "1"
         fi
         if declare -f send_telegram_position >/dev/null 2>&1; then
+            local close_vol_usdt
+            close_vol_usdt=$(format_position_volume_usdt "$symbol" "$(ob_get LAST_ENTRY "$symbol")" "$quantity")
             send_telegram_position "$close_dir" "$symbol futures
-#CLOSED $close_dir — opposite order book (qty $quantity)"
+#CLOSED $close_dir — opposite order book (Vol ${close_vol_usdt} USDT)"
         fi
         return 0
     fi
 
     [ -n "$log_fn" ] && $log_fn "❌ Close failed $symbol: $response"
     if declare -f log_trade >/dev/null 2>&1; then
-        log_trade "FAILED CLOSE $symbol $close_dir qty=$quantity reason=opposite_ob response=$(echo "$response" | tr -d '\n')"
+        log_trade "FAILED CLOSE $symbol $close_dir vol_usdt=$(format_position_volume_usdt "$symbol" "$(ob_get LAST_ENTRY "$symbol")" "$quantity") reason=opposite_ob response=$(echo "$response" | tr -d '\n')"
     fi
     if declare -f log_error >/dev/null 2>&1; then
         log_error "Close failed $symbol: $response"
@@ -1152,9 +1201,9 @@ futures_place_sl_tp_after_entry() {
         if [ "$sl_valid" -eq 1 ]; then
             if _futures_place_reduce_conditional "$symbol" "$direction" "STOP_MARKET" "$sl" "$fill_qty" "$log_fn"; then
                 sl_ok=0
-                [ -n "$log_fn" ] && $log_fn "🛡️ $symbol: STOP_MARKET SL @ $sl (qty $fill_qty)"
+                [ -n "$log_fn" ] && $log_fn "🛡️ $symbol: STOP_MARKET SL @ $sl (Vol $(format_position_volume_usdt "$symbol" "$entry_ref" "$fill_qty") USDT)"
                 if declare -f log_trade >/dev/null 2>&1; then
-                    log_trade "SL_PLACED $symbol $direction stop=$sl qty=$fill_qty mode=ALGO"
+                    log_trade "SL_PLACED $symbol $direction stop=$sl vol_usdt=$(format_position_volume_usdt "$symbol" "$entry_ref" "$fill_qty") mode=ALGO"
                 fi
             fi
         else
@@ -1179,9 +1228,9 @@ futures_place_sl_tp_after_entry() {
         if [ "$tp_valid" -eq 1 ]; then
             if _futures_place_reduce_conditional "$symbol" "$direction" "TAKE_PROFIT_MARKET" "$tp" "$fill_qty" "$log_fn"; then
                 tp_ok=0
-                [ -n "$log_fn" ] && $log_fn "🎯 $symbol: TAKE_PROFIT_MARKET TP @ $tp (qty $fill_qty)"
+                [ -n "$log_fn" ] && $log_fn "🎯 $symbol: TAKE_PROFIT_MARKET TP @ $tp (Vol $(format_position_volume_usdt "$symbol" "$entry_ref" "$fill_qty") USDT)"
                 if declare -f log_trade >/dev/null 2>&1; then
-                    log_trade "TP_PLACED $symbol $direction stop=$tp qty=$fill_qty mode=ALGO"
+                    log_trade "TP_PLACED $symbol $direction stop=$tp vol_usdt=$(format_position_volume_usdt "$symbol" "$entry_ref" "$fill_qty") mode=ALGO"
                 fi
             fi
         else

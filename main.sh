@@ -34,6 +34,10 @@ if [ ! -f "$SCRIPT_DIR/lib/ob_symbol_state.sh" ]; then
 fi
 # shellcheck source=lib/ob_symbol_state.sh
 source "$SCRIPT_DIR/lib/ob_symbol_state.sh"
+if [ -f "$SCRIPT_DIR/lib/ob_wall_history.sh" ]; then
+    # shellcheck source=lib/ob_wall_history.sh
+    source "$SCRIPT_DIR/lib/ob_wall_history.sh"
+fi
 if [ ! -f "$SCRIPT_DIR/lib/binance_timestamp.sh" ]; then
     echo "❌ Error: lib/binance_timestamp.sh not found in $SCRIPT_DIR/lib/"
     exit 1
@@ -73,6 +77,14 @@ ORDER_EXECUTION_MODE="${ORDER_EXECUTION_MODE:-rest}"
 # Trading parameters
 TP_PERCENT="${TP_PERCENT:-0.5}"
 SL_PERCENT="${SL_PERCENT:-0.4}"
+# TP_SL_MODE: percent (default) | ob_grid — SHORT SL=R1 TP=S0, LONG SL=S1 TP=R0
+TP_SL_MODE="${TP_SL_MODE:-percent}"
+OB_WALL_SHIFT_PCT="${OB_WALL_SHIFT_PCT:-0.15}"
+SL_OB_BUFFER_PCT="${SL_OB_BUFFER_PCT:-0.05}"
+TP_OB_BUFFER_PCT="${TP_OB_BUFFER_PCT:-0.05}"
+OB_GRID_MIN_SL_PCT="${OB_GRID_MIN_SL_PCT:-}"
+OB_GRID_MIN_R0_R1_GAP_PCT="${OB_GRID_MIN_R0_R1_GAP_PCT:-0.2}"
+OB_GRID_SL_RANGE_RATIO="${OB_GRID_SL_RANGE_RATIO:-0.382}"
 MIN_CONFIDENCE="${MIN_CONFIDENCE:-50}"
 
 # Volatile settings
@@ -103,7 +115,8 @@ ZONE_LOWER_PCT="${ZONE_LOWER_PCT:-25}"
 
 # Lock profit: move SL toward break-even as price advances toward TP (TP unchanged)
 LOCK_PROFIT_ENABLED="${LOCK_PROFIT_ENABLED:-true}"
-LOCK_PROFIT_BE_PCT="${LOCK_PROFIT_BE_PCT:-70}"
+LOCK_PROFIT_BE_PCT="${LOCK_PROFIT_BE_PCT:-50}"
+LOCK_PROFIT_SL_AT_PCT="${LOCK_PROFIT_SL_AT_PCT:-20}"
 LOCK_PROFIT_BUFFER_PCT="${LOCK_PROFIT_BUFFER_PCT:-0.05}"
 LOCK_PROFIT_STAGE2_PCT="${LOCK_PROFIT_STAGE2_PCT:-0}"
 LOCK_PROFIT_LOCK_RATIO="${LOCK_PROFIT_LOCK_RATIO:-0.5}"
@@ -343,7 +356,13 @@ send_order_binance_rest() {
         return 1
     fi
     
-    local quantity=$(calculate_quantity "$symbol" "$entry")
+    local quantity vol_usdt
+    quantity=$(calculate_quantity "$symbol" "$entry")
+    if declare -f format_position_volume_usdt >/dev/null 2>&1; then
+        vol_usdt=$(format_position_volume_usdt "$symbol" "$entry" "$quantity")
+    else
+        vol_usdt="${POSITION_SIZE_USDT:-?}"
+    fi
     local side="BUY"
     if [ "$direction" = "SHORT" ]; then
         side="SELL"
@@ -364,11 +383,11 @@ send_order_binance_rest() {
     local signature
     signature=$(echo -n "$query_string" | openssl dgst -sha256 -hmac "$BINANCE_SECRET_KEY" | awk '{print $2}')
     
-    log "📝 [REST] $symbol $direction | Entry:$entry SL:$sl TP:$tp | Qty:$quantity"
+    log "📝 [REST] $symbol $direction | Entry:$entry SL:$sl TP:$tp | Vol:${vol_usdt} USDT"
     
     if [ "$DRY_RUN" = true ]; then
         log "🔍 DRY-RUN: Would execute"
-        log_trade "DRY-RUN OPEN $symbol $direction entry=$entry sl=$sl tp=$tp qty=$quantity mode=REST"
+        log_trade "DRY-RUN OPEN $symbol $direction entry=$entry sl=$sl tp=$tp vol_usdt=$vol_usdt mode=REST"
         send_telegram_bot "DRY-RUN: $symbol $direction | Entry $entry"
         return 0
     fi
@@ -381,10 +400,10 @@ send_order_binance_rest() {
         local order_id
         order_id=$(echo "$response" | jq -r '.orderId' 2>/dev/null)
         log "✅ Order executed: $symbol (orderId $order_id)"
-        log_trade "OPEN $symbol $direction entry=$entry sl=$sl tp=$tp qty=$quantity mode=REST status=ok orderId=$order_id"
+        log_trade "OPEN $symbol $direction entry=$entry sl=$sl tp=$tp vol_usdt=$vol_usdt mode=REST status=ok orderId=$order_id"
         send_telegram_position "$direction" "$symbol futures
 LIMIT #OPEN $direction
-Entry: $entry | TP: $tp | SL: $sl | Qty: $quantity"
+Entry: $entry | TP: $tp | SL: $sl | Vol: ${vol_usdt} USDT"
 
         ob_set ACTIVE "$symbol" "true"
         ob_set ACTIVE_TS "$symbol" "$(date +%s)"
@@ -405,7 +424,7 @@ Entry: $entry | TP: $tp | SL: $sl | Qty: $quantity"
         return 0
     else
         log_error "Order failed: $response"
-        log_trade "FAILED OPEN $symbol $direction entry=$entry sl=$sl tp=$tp qty=$quantity mode=REST response=$(echo "$response" | tr -d '\n')"
+        log_trade "FAILED OPEN $symbol $direction entry=$entry sl=$sl tp=$tp vol_usdt=$vol_usdt mode=REST response=$(echo "$response" | tr -d '\n')"
         send_telegram "❌ $symbol futures — ORDER FAILED ($direction)"
         return 1
     fi
@@ -417,7 +436,15 @@ Entry: $entry | TP: $tp | SL: $sl | Qty: $quantity"
 
 send_order_finandy() {
     local symbol="$1" direction="$2" entry="$3" sl="$4" tp="$5"
-    
+    local quantity vol_usdt
+
+    quantity=$(calculate_quantity "$symbol" "$entry")
+    if declare -f format_position_volume_usdt >/dev/null 2>&1; then
+        vol_usdt=$(format_position_volume_usdt "$symbol" "$entry" "$quantity")
+    else
+        vol_usdt="${POSITION_SIZE_USDT:-?}"
+    fi
+
     local side="buy" pos_side="long"
     if [ "$direction" = "SHORT" ]; then
         side="sell"
@@ -447,10 +474,10 @@ send_order_finandy() {
 EOF
 )
     
-    log "📝 [FINANDY] $symbol $direction | Entry:$entry SL:$sl TP:$tp"
+    log "📝 [FINANDY] $symbol $direction | Entry:$entry SL:$sl TP:$tp | Vol:${vol_usdt} USDT"
     
     if [ "$DRY_RUN" = true ]; then
-        log_trade "DRY-RUN OPEN $symbol $direction entry=$entry sl=$sl tp=$tp mode=FINANDY"
+        log_trade "DRY-RUN OPEN $symbol $direction entry=$entry sl=$sl tp=$tp vol_usdt=$vol_usdt mode=FINANDY"
         return 0
     fi
     
@@ -458,10 +485,10 @@ EOF
     
     if echo "$response" | jq -e '.code == 200 or .success == true' >/dev/null 2>&1; then
         log "✅ Order executed via Finandy"
-        log_trade "OPEN $symbol $direction entry=$entry sl=$sl tp=$tp mode=FINANDY status=ok"
+        log_trade "OPEN $symbol $direction entry=$entry sl=$sl tp=$tp vol_usdt=$vol_usdt mode=FINANDY status=ok"
         send_telegram_position "$direction" "$symbol futures
 #OPEN $direction (Finandy)
-Entry: $entry | TP: $tp | SL: $sl"
+Entry: $entry | TP: $tp | SL: $sl | Vol: ${vol_usdt} USDT"
         ob_set ACTIVE "$symbol" "true"
         ob_set ACTIVE_TS "$symbol" "$(date +%s)"
         ob_set POS_DIR "$symbol" "$direction"
@@ -696,8 +723,15 @@ analyze_order_book() {
         fi
     done
     
-    ob_set SUPPORT "$symbol" "$support"
-    ob_set RESISTANCE "$symbol" "$resistance"
+    if declare -f ob_set_secondary_walls >/dev/null 2>&1; then
+        ob_set_secondary_walls "$symbol" "$bids" "$asks"
+    fi
+    if declare -f ob_promote_wall_history >/dev/null 2>&1; then
+        ob_promote_wall_history "$symbol" "$support" "$resistance"
+    else
+        ob_set SUPPORT "$symbol" "$support"
+        ob_set RESISTANCE "$symbol" "$resistance"
+    fi
 }
 
 # REST fallback when WebSocket has not populated a symbol yet
@@ -852,6 +886,23 @@ calculate_tp_sl() {
     if [ -z "$entry" ] || ! (( $(echo "$entry > 0" | bc -l 2>/dev/null) )); then
         echo "0|0|$sl_pct|$tp_pct"
         return 0
+    fi
+
+    if declare -f ob_tp_sl_mode_is_grid >/dev/null 2>&1 \
+        && ob_tp_sl_mode_is_grid \
+        && declare -f ob_freeze_signal_grid >/dev/null 2>&1 \
+        && declare -f ob_calculate_grid_tp_sl >/dev/null 2>&1; then
+        ob_freeze_signal_grid "$symbol" "$direction"
+        local grid_data grid_sl grid_tp grid_note
+        grid_data=$(ob_calculate_grid_tp_sl "$entry" "$direction" "$symbol")
+        grid_sl=$(echo "$grid_data" | cut -d'|' -f1)
+        grid_tp=$(echo "$grid_data" | cut -d'|' -f2)
+        grid_note=$(echo "$grid_data" | cut -d'|' -f3-)
+        if [ -n "$grid_sl" ] && [ "$grid_sl" != "0" ] \
+            && [ -n "$grid_tp" ] && [ "$grid_tp" != "0" ]; then
+            echo "$grid_sl|$grid_tp|grid|$grid_note"
+            return 0
+        fi
     fi
     
     local abs_change=$(echo "$change_24h" | tr -d '-')
@@ -1109,7 +1160,11 @@ draw_and_execute() {
         fi
 
         if [ "$signal_dir" != "NEUTRAL" ] && [ "$confidence" -ge "$MIN_CONFIDENCE" ] && [ "$closed_flag" -eq 0 ]; then
-            log_trade "SIGNAL $symbol $signal_dir conf=${confidence}% entry=$entry tp=$tp sl=$sl | $reasons"
+            local grid_extra=""
+            if declare -f ob_tp_sl_mode_is_grid >/dev/null 2>&1 && ob_tp_sl_mode_is_grid; then
+                grid_extra=" R0=$(ob_get SIGNAL_R0 "$symbol") R1=$(ob_get SIGNAL_R1 "$symbol") R2=$(ob_get SIGNAL_R2 "$symbol") S0=$(ob_get SIGNAL_S0 "$symbol") S1=$(ob_get SIGNAL_S1 "$symbol")"
+            fi
+            log_trade "SIGNAL $symbol $signal_dir conf=${confidence}% entry=$entry tp=$tp sl=$sl | $reasons${grid_extra}"
             if [ "$DRY_RUN" = true ]; then
                 log_trade "DRY-RUN_SIGNAL $symbol $signal_dir entry=$entry (no order sent)"
             else
@@ -1192,6 +1247,12 @@ run_cycle() {
         local _sym _lp_price
         for _sym in "${SYMBOL_ARRAY[@]}"; do
             _lp_price=$(ob_get PRICE "$_sym")
+            if [ -z "$_lp_price" ] || [ "$_lp_price" = "0" ]; then
+                _lp_price=$(ob_get ASK "$_sym")
+            fi
+            if [ -z "$_lp_price" ] || [ "$_lp_price" = "0" ]; then
+                _lp_price=$(ob_get BID "$_sym")
+            fi
             futures_try_lock_profit "$_sym" "$_lp_price" log
         done
     fi
@@ -1253,7 +1314,12 @@ main() {
         log "📊 Symbols: ${SYMBOLS}"
     fi
     log "🎯 Min Confidence: ${MIN_CONFIDENCE}%"
+    log "📐 TP/SL mode: ${TP_SL_MODE} (ob_grid: SHORT SL=R1 TP=S0, LONG SL=S1 TP=R0)"
+    if declare -f ob_tp_sl_mode_is_grid >/dev/null 2>&1 && ob_tp_sl_mode_is_grid; then
+        log "   OB wall shift: ${OB_WALL_SHIFT_PCT}% | buffers SL=${SL_OB_BUFFER_PCT}% TP=${TP_OB_BUFFER_PCT}%"
+    fi
     log "🛡️ REST SL/TP after fill: ${REST_PLACE_SL_TP} (wait ${REST_SL_TP_FILL_WAIT}s)"
+    log "🔐 Lock profit: ${LOCK_PROFIT_ENABLED} (trigger ${LOCK_PROFIT_BE_PCT}% toward TP → SL at ${LOCK_PROFIT_SL_AT_PCT}% entry→TP)"
     log "⏰ Order Cooldown: ${ORDER_COOLDOWN_SECONDS}s per symbol (local fallback without API)"
     log "🔄 Replace stale entry LIMIT: ${REPLACE_STALE_LIMITS} (REST only; max 1 cycle / 5s per symbol)"
     log "📁 Log: $LOG_FILE | Errors: $ERROR_LOG_FILE | Trades: $TRADES_LOG_FILE"

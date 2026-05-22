@@ -1,5 +1,5 @@
 #!/bin/bash
-# Move SL toward break-even / partial profit as price advances toward TP (TP orders unchanged)
+# Move SL toward LOCK_PROFIT_SL_AT_PCT of entry→TP when progress reaches LOCK_PROFIT_BE_PCT (TP unchanged)
 
 # Progress from entry toward TP (0–100). Echoes 0 if invalid.
 _lock_profit_progress_pct() {
@@ -124,11 +124,6 @@ futures_try_lock_profit() {
         return 1
     fi
 
-    local rest_sl_tp="${REST_PLACE_SL_TP:-true}"
-    case "$(echo "$rest_sl_tp" | tr '[:upper:]' '[:lower:]')" in
-        false|0|no|off) return 1 ;;
-    esac
-
     if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
         return 1
     fi
@@ -141,6 +136,10 @@ futures_try_lock_profit() {
     fi
 
     local pos_info direction entry tp last_sl stage qty
+    if declare -f sync_symbol_position_flags >/dev/null 2>&1; then
+        sync_symbol_position_flags "$symbol"
+    fi
+
     pos_info=$(futures_get_position "$symbol")
     if [ "$pos_info" = "none" ]; then
         return 1
@@ -154,6 +153,24 @@ futures_try_lock_profit() {
 
     entry=$(ob_get LAST_ENTRY "$symbol")
     tp=$(ob_get LAST_TP "$symbol")
+    if [ -z "$entry" ] || [ "$entry" = "0" ]; then
+        if declare -f futures_get_position_entry_price >/dev/null 2>&1; then
+            entry=$(futures_get_position_entry_price "$symbol" "$direction" 2>/dev/null)
+            if [ -n "$entry" ] && _bn_is_positive "$entry"; then
+                ob_set LAST_ENTRY "$symbol" "$entry"
+            fi
+        fi
+    fi
+    if [ -z "$tp" ] || [ "$tp" = "0" ]; then
+        if declare -f futures_get_open_sl_tp >/dev/null 2>&1; then
+            local sl_tp_h
+            sl_tp_h=$(futures_get_open_sl_tp "$symbol" "$direction" 2>/dev/null || echo "|")
+            tp=$(echo "$sl_tp_h" | cut -d'|' -f2)
+            if [ -n "$tp" ] && [ "$tp" != "null" ] && _bn_is_positive "$tp"; then
+                ob_set LAST_TP "$symbol" "$tp"
+            fi
+        fi
+    fi
     last_sl=$(ob_get LAST_SL "$symbol")
     stage=$(ob_get LOCK_PROFIT_STAGE "$symbol")
     [ "$stage" = "0" ] && stage=""
@@ -162,9 +179,10 @@ futures_try_lock_profit() {
         return 1
     fi
 
-    local progress be_pct stage2_pct buffer_pct lock_ratio new_sl
+    local progress be_pct stage2_pct buffer_pct lock_ratio sl_at_pct new_sl
     progress=$(_lock_profit_progress_pct "$direction" "$entry" "$tp" "$current_price")
-    be_pct="${LOCK_PROFIT_BE_PCT:-70}"
+    be_pct="${LOCK_PROFIT_BE_PCT:-50}"
+    sl_at_pct="${LOCK_PROFIT_SL_AT_PCT:-20}"
     stage2_pct="${LOCK_PROFIT_STAGE2_PCT:-0}"
     buffer_pct="${LOCK_PROFIT_BUFFER_PCT:-0.05}"
     lock_ratio="${LOCK_PROFIT_LOCK_RATIO:-0.5}"
@@ -215,8 +233,8 @@ futures_try_lock_profit() {
         return 1
     fi
 
-    # Stage 1: break-even (+ small buffer for fees); skip if already tightened
-    if [ "$stage" = "breakeven" ] || [ "$stage" = "lock" ]; then
+    # Stage 1: move SL to LOCK_PROFIT_SL_AT_PCT% of entry→TP when progress >= LOCK_PROFIT_BE_PCT
+    if [ "$stage" = "breakeven" ] || [ "$stage" = "lock_sl" ] || [ "$stage" = "lock" ]; then
         return 1
     fi
 
@@ -226,7 +244,12 @@ futures_try_lock_profit() {
 
     case "$(echo "$direction" | tr '[:upper:]' '[:lower:]')" in
         long)
-            new_sl=$(echo "$entry * (1 + $buffer_pct / 100)" | bc -l 2>/dev/null)
+            if [ -n "$sl_at_pct" ] && [ "$sl_at_pct" != "0" ] \
+                && (( $(echo "$sl_at_pct > 0" | bc -l 2>/dev/null) )); then
+                new_sl=$(echo "$entry + ($tp - $entry) * $sl_at_pct / 100" | bc -l 2>/dev/null)
+            else
+                new_sl=$(echo "$entry * (1 + $buffer_pct / 100)" | bc -l 2>/dev/null)
+            fi
             if [ -n "$last_sl" ] && [ "$last_sl" != "0" ] \
                 && _bn_price_gt "$last_sl" "$new_sl"; then
                 return 1
@@ -236,7 +259,12 @@ futures_try_lock_profit() {
             fi
             ;;
         short)
-            new_sl=$(echo "$entry * (1 - $buffer_pct / 100)" | bc -l 2>/dev/null)
+            if [ -n "$sl_at_pct" ] && [ "$sl_at_pct" != "0" ] \
+                && (( $(echo "$sl_at_pct > 0" | bc -l 2>/dev/null) )); then
+                new_sl=$(echo "$entry - ($entry - $tp) * $sl_at_pct / 100" | bc -l 2>/dev/null)
+            else
+                new_sl=$(echo "$entry * (1 - $buffer_pct / 100)" | bc -l 2>/dev/null)
+            fi
             if [ -n "$last_sl" ] && [ "$last_sl" != "0" ] \
                 && _bn_price_lt "$last_sl" "$new_sl"; then
                 return 1
@@ -255,14 +283,14 @@ futures_try_lock_profit() {
     fi
 
     if futures_move_sl_algo "$symbol" "$direction" "$new_sl" "$qty" "$log_fn"; then
-        ob_set LOCK_PROFIT_STAGE "$symbol" "breakeven"
-        [ -n "$log_fn" ] && $log_fn "🛡️ $symbol: SL → break-even @ $new_sl (${progress}% toward TP, TP unchanged)"
+        ob_set LOCK_PROFIT_STAGE "$symbol" "lock_sl"
+        [ -n "$log_fn" ] && $log_fn "🛡️ $symbol: SL → ${sl_at_pct}% entry→TP @ $new_sl (trigger ${progress}%≥${be_pct}% toward TP)"
         if declare -f log_trade >/dev/null 2>&1; then
-            log_trade "LOCK_PROFIT $symbol $direction stage=breakeven sl=$new_sl progress=${progress}% entry=$entry tp=$tp"
+            log_trade "LOCK_PROFIT $symbol $direction stage=lock_sl sl=$new_sl sl_at=${sl_at_pct}% trigger=${be_pct}% progress=${progress}% entry=$entry tp=$tp"
         fi
         if declare -f send_telegram_bot >/dev/null 2>&1; then
             send_telegram_bot "$symbol futures
-SL moved to break-even @ $new_sl (${progress}% toward TP)"
+SL moved to ${sl_at_pct}% entry→TP @ $new_sl (trigger ${be_pct}% toward TP)"
         fi
         return 0
     fi
