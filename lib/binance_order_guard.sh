@@ -193,9 +193,18 @@ futures_notify_position_exit() {
     fi
 
     if awk -v p="$realized" 'BEGIN { exit (p + 0 > 0) ? 0 : 1 }' 2>/dev/null; then
-        pnl_msg="TAKE_PROFIT #TP @ $last_price | PnL: ${pnl_label}"
-        if [ -n "$tp" ] && [ "$tp" != "0" ]; then
-            pnl_msg="TAKE_PROFIT #TP @ $last_price (TP $tp) | PnL: ${pnl_label}"
+        local tp_kind
+        tp_kind=$(ob_get LAST_TP_TYPE "$symbol" 2>/dev/null)
+        [ "$tp_kind" = "0" ] && tp_kind=""
+        if [ "$tp_kind" = "trailing" ]; then
+            local trail_rate
+            trail_rate=$(_bn_clamp_trailing_callback_rate "${TP_TRAILING_CALLBACK_RATE:-0.5}")
+            pnl_msg="TRAILING_TP @ $last_price (activate $tp, trail ${trail_rate}%) | PnL: ${pnl_label}"
+        else
+            pnl_msg="TAKE_PROFIT #TP @ $last_price | PnL: ${pnl_label}"
+            if [ -n "$tp" ] && [ "$tp" != "0" ]; then
+                pnl_msg="TAKE_PROFIT #TP @ $last_price (TP $tp) | PnL: ${pnl_label}"
+            fi
         fi
         if declare -f send_telegram_tp >/dev/null 2>&1; then
             send_telegram_tp "$symbol futures
@@ -289,7 +298,11 @@ futures_get_open_sl_tp() {
 
     tp=$(echo "$resp" | jq -r --arg ps "$want_ps" '
         (if .orders then .orders else . end) | .[]?
-        | select(.orderType == "TAKE_PROFIT_MARKET" or .orderType == "TAKE_PROFIT" or .type == "TAKE_PROFIT_MARKET")
+        | select(
+            .orderType == "TAKE_PROFIT_MARKET" or .orderType == "TAKE_PROFIT"
+            or .type == "TAKE_PROFIT_MARKET"
+            or .orderType == "TRAILING_STOP_MARKET" or .type == "TRAILING_STOP_MARKET"
+          )
         | select(
             (.algoStatus // .status // "NEW") == "NEW"
             or (.algoStatus // .status) == "ACTIVE"
@@ -297,7 +310,7 @@ futures_get_open_sl_tp() {
         | select(
             ($ps == "") or (.positionSide // "") == $ps or (.positionSide // "") == ""
           )
-        | (.triggerPrice // .stopPrice // .price) | tostring' 2>/dev/null | head -1)
+        | (.triggerPrice // .activatePrice // .stopPrice // .price) | tostring' 2>/dev/null | head -1)
 
     if declare -f round_price_for_symbol >/dev/null 2>&1; then
         [ -n "$sl" ] && [ "$sl" != "null" ] && sl=$(round_price_for_symbol "$symbol" "$sl")
@@ -507,6 +520,7 @@ sync_symbol_position_flags() {
     ob_set POS_DIR "$symbol" ""
     ob_set LAST_ENTRY "$symbol" ""
     ob_set LAST_TP "$symbol" ""
+    ob_set LAST_TP_TYPE "$symbol" ""
     ob_set LAST_SL "$symbol" ""
     ob_set LOCK_PROFIT_STAGE "$symbol" ""
     ob_set DCA_ACTIVE "$symbol" "false"
@@ -1026,6 +1040,39 @@ _bn_price_lt() {
     awk -v a="$1" -v b="$2" 'BEGIN { exit (a + 0 < b + 0) ? 0 : 1 }'
 }
 
+# TP_ORDER_TYPE: fixed (TAKE_PROFIT_MARKET) | trailing (TRAILING_STOP_MARKET from TP activate price)
+_bn_tp_order_type_normalized() {
+    case "$(echo "${TP_ORDER_TYPE:-fixed}" | tr '[:upper:]' '[:lower:]')" in
+        trailing|trail|trailing_stop) echo "trailing" ;;
+        *) echo "fixed" ;;
+    esac
+}
+
+_bn_tp_order_type_is_trailing() {
+    [ "$(_bn_tp_order_type_normalized)" = "trailing" ]
+}
+
+_bn_clamp_trailing_callback_rate() {
+    local rate="${1:-0.5}"
+    awk -v r="$rate" 'BEGIN {
+        if (r + 0 < 0.1) r = 0.1
+        if (r + 0 > 10) r = 10
+        printf "%.1f", r + 0
+    }'
+}
+
+# Echo suffix for Telegram/dashboard: " (fixed)" or " (trail 0.5%)"
+format_tp_order_label() {
+    local tp="$1"
+    if _bn_tp_order_type_is_trailing; then
+        local rate
+        rate=$(_bn_clamp_trailing_callback_rate "${TP_TRAILING_CALLBACK_RATE:-0.5}")
+        printf 'TP: %s (trail %s%%)' "$tp" "$rate"
+    else
+        printf 'TP: %s (fixed)' "$tp"
+    fi
+}
+
 # Wait for entry LIMIT fill; echoes executed quantity on success
 futures_wait_limit_fill() {
     local symbol="$1"
@@ -1131,6 +1178,65 @@ _futures_place_reduce_conditional() {
     return 1
 }
 
+# Trailing take-profit: activates at TP price, closes on pullback (callbackRate %)
+_futures_place_trailing_tp() {
+    local symbol="$1"
+    local position_dir="$2"
+    local activate_price="$3"
+    local quantity="$4"
+    local callback_rate="$5"
+    local log_fn="${6:-}"
+
+    local side query_string response dry_run
+    dry_run="${DRY_RUN:-false}"
+
+    case "$(echo "$position_dir" | tr '[:lower:]' '[:upper:]')" in
+        LONG) side="SELL" ;;
+        SHORT) side="BUY" ;;
+        *) return 1 ;;
+    esac
+
+    callback_rate=$(_bn_clamp_trailing_callback_rate "$callback_rate")
+
+    if declare -f round_price_for_symbol >/dev/null 2>&1; then
+        activate_price=$(round_price_for_symbol "$symbol" "$activate_price")
+        quantity=$(round_qty_for_symbol "$symbol" "$quantity")
+    fi
+
+    if [ -z "$activate_price" ] || ! _bn_is_positive "$activate_price" \
+        || [ -z "$quantity" ] || ! _bn_is_positive "$quantity"; then
+        return 1
+    fi
+
+    if [ "$dry_run" = true ]; then
+        [ -n "$log_fn" ] && $log_fn "🔍 DRY-RUN: Would place TRAILING_STOP_MARKET $position_dir $symbol activate=$activate_price callback=${callback_rate}% qty=$quantity"
+        return 0
+    fi
+
+    query_string="symbol=${symbol}&algoType=CONDITIONAL&side=${side}&type=TRAILING_STOP_MARKET&activatePrice=${activate_price}&callbackRate=${callback_rate}&quantity=${quantity}&workingType=CONTRACT_PRICE"
+    if declare -f binance_is_hedge_mode >/dev/null 2>&1 && binance_is_hedge_mode; then
+        if declare -f append_position_side_param >/dev/null 2>&1; then
+            query_string=$(append_position_side_param "$position_dir" "$query_string")
+        fi
+    else
+        query_string="${query_string}&reduceOnly=true"
+    fi
+
+    response=$(_binance_fapi_signed_post "/fapi/v1/algoOrder" "$query_string")
+    if echo "$response" | jq -e '.algoId' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    [ -n "$log_fn" ] && $log_fn "❌ TRAILING_STOP_MARKET (algo) failed $symbol: $response"
+    if declare -f log_error >/dev/null 2>&1; then
+        log_error "TRAILING_STOP_MARKET (algo) failed $symbol: $response"
+    fi
+    if declare -f log_trade >/dev/null 2>&1; then
+        log_trade "FAILED TRAILING_TP $symbol $position_dir activate=$activate_price callback=${callback_rate}% qty=$quantity response=$(echo "$response" | tr -d '\n')"
+    fi
+    return 1
+}
+
 futures_place_sl_tp_after_entry() {
     local symbol="$1"
     local direction="$2"
@@ -1229,11 +1335,27 @@ futures_place_sl_tp_after_entry() {
                 ;;
         esac
         if [ "$tp_valid" -eq 1 ]; then
-            if _futures_place_reduce_conditional "$symbol" "$direction" "TAKE_PROFIT_MARKET" "$tp" "$fill_qty" "$log_fn"; then
+            if _bn_tp_order_type_is_trailing; then
+                local cb_rate
+                cb_rate=$(_bn_clamp_trailing_callback_rate "${TP_TRAILING_CALLBACK_RATE:-0.5}")
+                if _futures_place_trailing_tp "$symbol" "$direction" "$tp" "$fill_qty" "$cb_rate" "$log_fn"; then
+                    tp_ok=0
+                    if declare -f ob_set >/dev/null 2>&1; then
+                        ob_set LAST_TP_TYPE "$symbol" "trailing"
+                    fi
+                    [ -n "$log_fn" ] && $log_fn "🎯 $symbol: TRAILING_TP activate @ $tp callback ${cb_rate}% (Vol $(format_position_volume_usdt "$symbol" "$entry_ref" "$fill_qty") USDT)"
+                    if declare -f log_trade >/dev/null 2>&1; then
+                        log_trade "TP_PLACED $symbol $direction type=trailing activate=$tp callback=${cb_rate}% vol_usdt=$(format_position_volume_usdt "$symbol" "$entry_ref" "$fill_qty") mode=ALGO"
+                    fi
+                fi
+            elif _futures_place_reduce_conditional "$symbol" "$direction" "TAKE_PROFIT_MARKET" "$tp" "$fill_qty" "$log_fn"; then
                 tp_ok=0
+                if declare -f ob_set >/dev/null 2>&1; then
+                    ob_set LAST_TP_TYPE "$symbol" "fixed"
+                fi
                 [ -n "$log_fn" ] && $log_fn "🎯 $symbol: TAKE_PROFIT_MARKET TP @ $tp (Vol $(format_position_volume_usdt "$symbol" "$entry_ref" "$fill_qty") USDT)"
                 if declare -f log_trade >/dev/null 2>&1; then
-                    log_trade "TP_PLACED $symbol $direction stop=$tp vol_usdt=$(format_position_volume_usdt "$symbol" "$entry_ref" "$fill_qty") mode=ALGO"
+                    log_trade "TP_PLACED $symbol $direction type=fixed stop=$tp vol_usdt=$(format_position_volume_usdt "$symbol" "$entry_ref" "$fill_qty") mode=ALGO"
                 fi
             fi
         else

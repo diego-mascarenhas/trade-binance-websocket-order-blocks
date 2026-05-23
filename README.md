@@ -81,6 +81,17 @@ ALLOWED_DAYS=2,3,4
 
 Set `TRADING_SCHEDULE_ENABLED=false` for 24/7 trading.
 
+### TP order type (on Binance)
+
+Requires `REST_PLACE_SL_TP=true`. Set in `.env`:
+
+| `TP_ORDER_TYPE` | Behaviour |
+|-----------------|-----------|
+| `fixed` (default) | `TAKE_PROFIT_MARKET` at the calculated TP price |
+| `trailing` | `TRAILING_STOP_MARKET`: activates when price reaches TP, then trails by `TP_TRAILING_CALLBACK_RATE` % (0.1–10, default `0.5`) |
+
+Example trailing TP (SHORT, TP `0.2025`, callback `0.5%`): when price reaches `0.2025`, the stop follows the low; if price bounces 0.5% from the best level, the position closes (often above the fixed TP).
+
 ### TP/SL modes
 
 - **`percent`** (default): `SL_PERCENT` / `TP_PERCENT` from entry price.

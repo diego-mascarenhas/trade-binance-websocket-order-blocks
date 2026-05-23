@@ -126,6 +126,10 @@ REST_PLACE_SL_TP="${REST_PLACE_SL_TP:-true}"
 REST_SL_TP_FILL_WAIT="${REST_SL_TP_FILL_WAIT:-90}"
 REST_SL_TP_POLL_INTERVAL="${REST_SL_TP_POLL_INTERVAL:-2}"
 
+# TP on exchange: fixed = TAKE_PROFIT_MARKET at TP price | trailing = TRAILING_STOP_MARKET from TP
+TP_ORDER_TYPE="${TP_ORDER_TYPE:-fixed}"
+TP_TRAILING_CALLBACK_RATE="${TP_TRAILING_CALLBACK_RATE:-0.5}"
+
 # Close open position when price touches opposite OB wall
 CLOSE_ON_OPPOSITE="${CLOSE_ON_OPPOSITE:-true}"
 ZONE_UPPER_PCT="${ZONE_UPPER_PCT:-75}"
@@ -439,9 +443,13 @@ send_order_binance_rest() {
         order_id=$(echo "$response" | jq -r '.orderId' 2>/dev/null)
         log "✅ Order executed: $symbol (orderId $order_id)"
         log_trade "OPEN $symbol $direction entry=$entry sl=$sl tp=$tp vol_usdt=$vol_usdt mode=REST status=ok orderId=$order_id"
+        local tp_label="TP: $tp"
+        if declare -f format_tp_order_label >/dev/null 2>&1; then
+            tp_label=$(format_tp_order_label "$tp")
+        fi
         send_telegram_position "$direction" "$symbol futures
 LIMIT #OPEN $direction
-Entry: $entry | TP: $tp | SL: $sl | Vol: ${vol_usdt} USDT"
+Entry: $entry | ${tp_label} | SL: $sl | Vol: ${vol_usdt} USDT"
 
         ob_set ACTIVE "$symbol" "true"
         ob_set ACTIVE_TS "$symbol" "$(date +%s)"
@@ -450,11 +458,17 @@ Entry: $entry | TP: $tp | SL: $sl | Vol: ${vol_usdt} USDT"
         ob_set LAST_TP "$symbol" "$tp"
         ob_set LAST_SL "$symbol" "$sl"
         ob_set EXIT_NOTIFIED "$symbol" ""
+        if declare -f _bn_tp_order_type_is_trailing >/dev/null 2>&1 && _bn_tp_order_type_is_trailing; then
+            ob_set LAST_TP_TYPE "$symbol" "trailing"
+        else
+            ob_set LAST_TP_TYPE "$symbol" "fixed"
+        fi
 
         if declare -f futures_place_sl_tp_after_entry >/dev/null 2>&1; then
             (
                 export TRADES_LOG_FILE BOT_LOG_BASE_DIR BINANCE_API_KEY BINANCE_SECRET_KEY
                 export DRY_RUN REST_PLACE_SL_TP REST_SL_TP_FILL_WAIT REST_SL_TP_POLL_INTERVAL
+                export TP_ORDER_TYPE TP_TRAILING_CALLBACK_RATE
                 export BINANCE_HEDGE_MODE BINANCE_POSITION_MODE
                 futures_place_sl_tp_after_entry "$symbol" "$direction" "$sl" "$tp" "$quantity" "$order_id" log
             ) &
@@ -1396,6 +1410,11 @@ main() {
         log "   OB wall shift: ${OB_WALL_SHIFT_PCT}% | buffers SL=${SL_OB_BUFFER_PCT}% TP=${TP_OB_BUFFER_PCT}%"
     fi
     log "🛡️ REST SL/TP after fill: ${REST_PLACE_SL_TP} (wait ${REST_SL_TP_FILL_WAIT}s)"
+    if declare -f _bn_tp_order_type_is_trailing >/dev/null 2>&1 && _bn_tp_order_type_is_trailing; then
+        log "🎯 TP order: trailing (activate at TP, callback ${TP_TRAILING_CALLBACK_RATE}%, range 0.1–10)"
+    else
+        log "🎯 TP order: fixed (TAKE_PROFIT_MARKET at TP price)"
+    fi
     log "🔐 Lock profit: ${LOCK_PROFIT_ENABLED} (trigger ${LOCK_PROFIT_BE_PCT}% toward TP → SL at ${LOCK_PROFIT_SL_AT_PCT}% entry→TP)"
     log "⏰ Order Cooldown: ${ORDER_COOLDOWN_SECONDS}s per symbol (local fallback without API)"
     if declare -f trading_schedule_summary >/dev/null 2>&1; then
