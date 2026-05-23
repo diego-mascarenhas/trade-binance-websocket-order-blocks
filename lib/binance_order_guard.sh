@@ -339,6 +339,21 @@ _futures_hydrate_open_leg() {
     tp=$(echo "$sl_tp" | cut -d'|' -f2)
     [ -n "$sl" ] && [ "$sl" != "null" ] && ob_set LAST_SL "$symbol" "$sl"
     [ -n "$tp" ] && [ "$tp" != "null" ] && ob_set LAST_TP "$symbol" "$tp"
+
+    if declare -f _dca_enabled >/dev/null 2>&1 && _dca_enabled \
+        && declare -f futures_dca_init_symbol >/dev/null 2>&1; then
+        local dca_base
+        dca_base=$(ob_get DCA_BASE_NOTIONAL "$symbol")
+        if [ -z "$dca_base" ] || [ "$dca_base" = "0" ]; then
+            if entry=$(futures_get_position_entry_price "$symbol" "$direction" 2>/dev/null); then
+                if declare -f calculate_position_notional_usdt >/dev/null 2>&1; then
+                    futures_dca_init_symbol "$symbol" "$direction" "$entry" "$(calculate_position_notional_usdt)"
+                else
+                    futures_dca_init_symbol "$symbol" "$direction" "$entry" "${POSITION_SIZE_USDT:-50}"
+                fi
+            fi
+        fi
+    fi
 }
 
 # Mark symbol active from a pending entry LIMIT (no filled position yet)
@@ -538,10 +553,14 @@ sync_symbol_position_flags() {
     ob_set LAST_TP_TYPE "$symbol" ""
     ob_set LAST_SL "$symbol" ""
     ob_set LOCK_PROFIT_STAGE "$symbol" ""
-    ob_set DCA_ACTIVE "$symbol" "false"
-    ob_set DCA_DIR "$symbol" ""
-    ob_set DCA_SL "$symbol" ""
-    ob_set DCA_TP "$symbol" ""
+    if declare -f futures_dca_reset_symbol >/dev/null 2>&1; then
+        futures_dca_reset_symbol "$symbol"
+    else
+        ob_set DCA_ACTIVE "$symbol" "false"
+        ob_set DCA_DIR "$symbol" ""
+        ob_set DCA_SL "$symbol" ""
+        ob_set DCA_TP "$symbol" ""
+    fi
     return 0
 }
 
@@ -795,10 +814,9 @@ futures_close_position_market() {
             ob_set LAST_TP "$symbol" ""
             ob_set LAST_SL "$symbol" ""
             ob_set LOCK_PROFIT_STAGE "$symbol" ""
-            ob_set DCA_ACTIVE "$symbol" "false"
-            ob_set DCA_DIR "$symbol" ""
-            ob_set DCA_SL "$symbol" ""
-            ob_set DCA_TP "$symbol" ""
+            if declare -f futures_dca_reset_symbol >/dev/null 2>&1; then
+                futures_dca_reset_symbol "$symbol"
+            fi
             ob_set OB_CLOSE_SUPPRESS "$symbol" "$(date +%s)"
             ob_set EXIT_NOTIFIED "$symbol" "1"
         fi
@@ -1001,6 +1019,51 @@ futures_has_limit_at_price() {
         | "\(.side)|\(.price)|\(.positionSide // "")"' 2>/dev/null)
 
     return 1
+}
+
+# DCA add: same direction position required; block duplicate limit at price
+can_place_dca_order() {
+    local symbol="$1"
+    local direction="$2"
+    local entry="$3"
+    local log_fn="${4:-}"
+    local pos_info pos_dir
+
+    if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
+        return 0
+    fi
+
+    if ! declare -f futures_has_filled_position >/dev/null 2>&1 \
+        || ! futures_has_filled_position "$symbol"; then
+        [ -n "$log_fn" ] && $log_fn "⏸️ $symbol: DCA — no filled position"
+        return 1
+    fi
+
+    pos_info=$(futures_get_position "$symbol" "$direction")
+    if [ "$pos_info" = "none" ]; then
+        pos_info=$(futures_get_position "$symbol")
+    fi
+    if [ "$pos_info" = "none" ]; then
+        [ -n "$log_fn" ] && $log_fn "⏸️ $symbol: DCA — position side mismatch"
+        return 1
+    fi
+    pos_dir=$(echo "$pos_info" | cut -d'|' -f1)
+    if [ "$pos_dir" != "$direction" ]; then
+        [ -n "$log_fn" ] && $log_fn "⏸️ $symbol: DCA — position is $pos_dir not $direction"
+        return 1
+    fi
+
+    if futures_has_conflicting_entry_limits "$symbol"; then
+        [ -n "$log_fn" ] && $log_fn "⏸️ $symbol: DCA — conflicting entry limits"
+        return 1
+    fi
+
+    if futures_has_limit_at_price "$symbol" "$direction" "$entry"; then
+        [ -n "$log_fn" ] && $log_fn "⏸️ $symbol: DCA limit already at $entry"
+        return 1
+    fi
+
+    return 0
 }
 
 # return 0 = allowed to place | return 1 = blocked (skip)

@@ -64,6 +64,10 @@ if [ -f "$SCRIPT_DIR/lib/binance_lock_profit.sh" ]; then
     # shellcheck source=lib/binance_lock_profit.sh
     source "$SCRIPT_DIR/lib/binance_lock_profit.sh"
 fi
+if [ -f "$SCRIPT_DIR/lib/binance_dca.sh" ]; then
+    # shellcheck source=lib/binance_dca.sh
+    source "$SCRIPT_DIR/lib/binance_dca.sh"
+fi
 
 if [ -f .env ]; then
     source .env
@@ -142,6 +146,13 @@ LOCK_PROFIT_SL_AT_PCT="${LOCK_PROFIT_SL_AT_PCT:-40}"
 LOCK_PROFIT_BUFFER_PCT="${LOCK_PROFIT_BUFFER_PCT:-0.05}"
 LOCK_PROFIT_STAGE2_PCT="${LOCK_PROFIT_STAGE2_PCT:-0}"
 LOCK_PROFIT_LOCK_RATIO="${LOCK_PROFIT_LOCK_RATIO:-0.5}"
+
+# DCA: min distance (DCA_TRIGGER_PCT) then same signal/order path as entry
+DCA_ENABLED="${DCA_ENABLED:-false}"
+DCA_TRIGGER_PCT="${DCA_TRIGGER_PCT:-0.4}"
+DCA_MAX_STEPS="${DCA_MAX_STEPS:-3}"
+DCA_MULTIPLIER="${DCA_MULTIPLIER:-1.0}"
+DCA_COOLDOWN_SECONDS="${DCA_COOLDOWN_SECONDS:-120}"
 
 # Binance API
 BINANCE_API_KEY="${BINANCE_API_KEY:-}"
@@ -382,6 +393,7 @@ calculate_quantity() {
 
 send_order_binance_rest() {
     local symbol="$1" direction="$2" entry="$3" sl="$4" tp="$5"
+    local order_kind="${6:-entry}"
     
     if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
         log_error "Binance API keys not configured"
@@ -389,11 +401,20 @@ send_order_binance_rest() {
     fi
     
     local quantity vol_usdt notional_usdt lev_applied
-    quantity=$(calculate_quantity "$symbol" "$entry")
-    if declare -f calculate_position_notional_usdt >/dev/null 2>&1; then
-        notional_usdt=$(calculate_position_notional_usdt)
+    if [ "$order_kind" = "dca" ] && declare -f calculate_dca_quantity >/dev/null 2>&1; then
+        quantity=$(calculate_dca_quantity "$symbol" "$entry")
+        if declare -f calculate_dca_notional_usdt >/dev/null 2>&1; then
+            notional_usdt=$(calculate_dca_notional_usdt "$symbol")
+        else
+            notional_usdt="${POSITION_SIZE_USDT:-?}"
+        fi
     else
-        notional_usdt="${POSITION_SIZE_USDT:-?}"
+        quantity=$(calculate_quantity "$symbol" "$entry")
+        if declare -f calculate_position_notional_usdt >/dev/null 2>&1; then
+            notional_usdt=$(calculate_position_notional_usdt)
+        else
+            notional_usdt="${POSITION_SIZE_USDT:-?}"
+        fi
     fi
     if declare -f format_position_volume_usdt >/dev/null 2>&1; then
         vol_usdt=$(format_position_volume_usdt "$symbol" "$entry" "$quantity")
@@ -442,14 +463,31 @@ send_order_binance_rest() {
         local order_id
         order_id=$(echo "$response" | jq -r '.orderId' 2>/dev/null)
         log "✅ Order executed: $symbol (orderId $order_id)"
-        log_trade "OPEN $symbol $direction entry=$entry sl=$sl tp=$tp vol_usdt=$vol_usdt mode=REST status=ok orderId=$order_id"
         local tp_label="TP: $tp"
         if declare -f format_tp_order_label >/dev/null 2>&1; then
             tp_label=$(format_tp_order_label "$tp")
         fi
-        send_telegram_position "$direction" "$symbol futures
+        if [ "$order_kind" = "dca" ]; then
+            local dca_n
+            dca_n=$(ob_get DCA_STEP "$symbol")
+            [ "$dca_n" = "0" ] && dca_n=0
+            dca_n=$((dca_n + 1))
+            log_trade "DCA_ADD $symbol $direction entry=$entry sl=$sl tp=$tp vol_usdt=$vol_usdt mode=REST status=ok orderId=$order_id step=$dca_n"
+            send_telegram_position "$direction" "$symbol futures
+LIMIT #DCA${dca_n} $direction
+Entry: $entry | ${tp_label} | SL: $sl | Vol: ${vol_usdt} USDT"
+            if declare -f futures_dca_mark_add_placed >/dev/null 2>&1; then
+                futures_dca_mark_add_placed "$symbol" "$direction" "$entry"
+            fi
+        else
+            log_trade "OPEN $symbol $direction entry=$entry sl=$sl tp=$tp vol_usdt=$vol_usdt mode=REST status=ok orderId=$order_id"
+            send_telegram_position "$direction" "$symbol futures
 LIMIT #OPEN $direction
 Entry: $entry | ${tp_label} | SL: $sl | Vol: ${vol_usdt} USDT"
+            if declare -f futures_dca_init_symbol >/dev/null 2>&1; then
+                futures_dca_init_symbol "$symbol" "$direction" "$entry" "$notional_usdt"
+            fi
+        fi
 
         ob_set ACTIVE "$symbol" "true"
         ob_set EXPOSURE "$symbol" "pending"
@@ -470,6 +508,7 @@ Entry: $entry | ${tp_label} | SL: $sl | Vol: ${vol_usdt} USDT"
                 export TRADES_LOG_FILE BOT_LOG_BASE_DIR BINANCE_API_KEY BINANCE_SECRET_KEY
                 export DRY_RUN REST_PLACE_SL_TP REST_SL_TP_FILL_WAIT REST_SL_TP_POLL_INTERVAL
                 export TP_ORDER_TYPE TP_TRAILING_CALLBACK_RATE
+                export DCA_ENABLED DCA_TRIGGER_PCT DCA_MAX_STEPS DCA_MULTIPLIER DCA_COOLDOWN_SECONDS
                 export BINANCE_HEDGE_MODE BINANCE_POSITION_MODE
                 futures_place_sl_tp_after_entry "$symbol" "$direction" "$sl" "$tp" "$quantity" "$order_id" log
             ) &
@@ -702,6 +741,59 @@ send_order() {
     esac
 }
 
+# DCA: same LIMIT + TP/SL path as entry (after min distance DCA_TRIGGER_PCT)
+send_order_dca() {
+    local symbol="$1" direction="$2" entry="$3" sl="$4" tp="$5"
+    local replace_rc=0 sched_reason
+
+    if declare -f is_trading_time_allowed >/dev/null 2>&1 \
+        && ! is_trading_time_allowed; then
+        sched_reason=$(trading_schedule_block_reason 2>/dev/null)
+        log_trade "SKIP_DCA $symbol $direction entry=$entry reason=outside_schedule ${sched_reason}"
+        return 0
+    fi
+
+    entry=$(round_price_for_symbol "$symbol" "$entry")
+    sl=$(round_price_for_symbol "$symbol" "$sl")
+    tp=$(round_price_for_symbol "$symbol" "$tp")
+
+    if declare -f clamp_limit_price_for_order >/dev/null 2>&1; then
+        local mark clamped_entry
+        mark=$(get_futures_mark_price "$symbol")
+        clamped_entry=$(clamp_limit_price_for_order "$symbol" "$direction" "$entry" "$mark")
+        if [ -n "$clamped_entry" ] && [ "$clamped_entry" != "$entry" ]; then
+            log "⚠️ DCA entry clamped $symbol $direction: $entry → $clamped_entry"
+            entry="$clamped_entry"
+        fi
+    fi
+    entry=$(round_price_for_symbol "$symbol" "$entry")
+    sl=$(round_price_for_symbol "$symbol" "$sl")
+    tp=$(round_price_for_symbol "$symbol" "$tp")
+
+    replace_rc=0
+    ob_replace_stale_entry_limits "$symbol" "$direction" "$entry" log || replace_rc=$?
+    if [ "$replace_rc" -eq 2 ]; then
+        log_trade "SKIP_DCA $symbol $direction entry=$entry reason=limit_already_at_price"
+        return 0
+    fi
+
+    if declare -f can_place_dca_order >/dev/null 2>&1; then
+        if ! can_place_dca_order "$symbol" "$direction" "$entry" log; then
+            log_trade "SKIP_DCA $symbol $direction entry=$entry reason=guard_blocked"
+            return 0
+        fi
+    fi
+
+    case "$ORDER_EXECUTION_MODE" in
+        finandy)
+            send_order_finandy "$symbol" "$direction" "$entry" "$sl" "$tp"
+            ;;
+        *)
+            send_order_binance_rest "$symbol" "$direction" "$entry" "$sl" "$tp" "dca"
+            ;;
+    esac
+}
+
 # ============================================
 # MARKET DATA FUNCTIONS
 # ============================================
@@ -824,40 +916,15 @@ hydrate_missing_symbols() {
 }
 
 # ============================================
-# DETERMINE SIGNAL (with position check)
+# DETERMINE SIGNAL (OB core + entry guards)
 # ============================================
 
-determine_signal() {
+# Same OB logic as entry; no position/pending guards (used for DCA after distance check)
+determine_signal_ob_core() {
     local symbol="$1"
     local current_price="$2"
     local change_24h="$3"
-    
-    # Block when any significant filled position exists (both legs in hedge mode)
-    if declare -f futures_has_filled_position >/dev/null 2>&1 \
-        && futures_has_filled_position "$symbol"; then
-        echo "NEUTRAL|0|0|Position already open"
-        return
-    fi
 
-    if declare -f futures_has_conflicting_entry_limits >/dev/null 2>&1 \
-        && futures_has_conflicting_entry_limits "$symbol"; then
-        echo "NEUTRAL|0|0|Conflicting entry limits"
-        return
-    fi
-
-    local replace_stale=false
-    case "$(echo "${REPLACE_STALE_LIMITS}" | tr '[:upper:]' '[:lower:]')" in
-        true|1|yes|on) replace_stale=true ;;
-    esac
-    if [ "$replace_stale" != true ]; then
-        local position_status
-        position_status=$(check_open_position "$symbol")
-        if [ "$position_status" = "active" ]; then
-            echo "NEUTRAL|0|0|Pending limit or position"
-            return
-        fi
-    fi
-    
     local support resistance best_bid best_ask
     support=$(ob_get SUPPORT "$symbol")
     resistance=$(ob_get RESISTANCE "$symbol")
@@ -941,6 +1008,39 @@ determine_signal() {
     
     entry=$(round_price_for_symbol "$symbol" "$entry")
     echo "$signal|$confidence|$entry|$reasons"
+}
+
+determine_signal() {
+    local symbol="$1"
+    local current_price="$2"
+    local change_24h="$3"
+
+    if declare -f futures_has_filled_position >/dev/null 2>&1 \
+        && futures_has_filled_position "$symbol"; then
+        echo "NEUTRAL|0|0|Position already open"
+        return
+    fi
+
+    if declare -f futures_has_conflicting_entry_limits >/dev/null 2>&1 \
+        && futures_has_conflicting_entry_limits "$symbol"; then
+        echo "NEUTRAL|0|0|Conflicting entry limits"
+        return
+    fi
+
+    local replace_stale=false
+    case "$(echo "${REPLACE_STALE_LIMITS}" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes|on) replace_stale=true ;;
+    esac
+    if [ "$replace_stale" != true ]; then
+        local position_status
+        position_status=$(check_open_position "$symbol")
+        if [ "$position_status" = "active" ]; then
+            echo "NEUTRAL|0|0|Pending limit or position"
+            return
+        fi
+    fi
+
+    determine_signal_ob_core "$symbol" "$current_price" "$change_24h"
 }
 
 # ============================================
@@ -1095,7 +1195,7 @@ _dashboard_color_row() {
     case "$stat" in
         OK) stat_c="$GREEN" ;;
         WATCH) stat_c="$YELLOW" ;;
-        OPEN) stat_c="$CYAN" ;;
+        OPEN|DCA*) stat_c="$CYAN" ;;
         PEND) stat_c="$YELLOW" ;;
         CLOSE) stat_c="$MAGENTA" ;;
         *) stat_c="$WHITE" ;;
@@ -1221,7 +1321,13 @@ draw_and_execute() {
 
         status_label=$(_dashboard_status_label "$signal" "$confidence" "$MIN_CONFIDENCE" "$closed_flag")
         if [ "$pos_col" = "OPEN" ]; then
-            status_label="OPEN"
+            local dca_step
+            dca_step=$(ob_get DCA_STEP "$symbol")
+            if [ -n "$dca_step" ] && [ "$dca_step" != "0" ] && [ "$dca_step" != "false" ]; then
+                status_label="DCA${dca_step}"
+            else
+                status_label="OPEN"
+            fi
         elif [ "$pos_col" = "PEND" ]; then
             status_label="PEND"
         fi
@@ -1346,6 +1452,20 @@ run_cycle() {
         done
     fi
 
+    if declare -f futures_try_dca_add >/dev/null 2>&1; then
+        local _sym_d _dca_price
+        for _sym_d in "${SYMBOL_ARRAY[@]}"; do
+            _dca_price=$(ob_get PRICE "$_sym_d")
+            if [ -z "$_dca_price" ] || [ "$_dca_price" = "0" ]; then
+                _dca_price=$(ob_get ASK "$_sym_d")
+            fi
+            if [ -z "$_dca_price" ] || [ "$_dca_price" = "0" ]; then
+                _dca_price=$(ob_get BID "$_sym_d")
+            fi
+            futures_try_dca_add "$_sym_d" "$_dca_price" log
+        done
+    fi
+
     draw_and_execute
 }
 
@@ -1424,6 +1544,11 @@ main() {
         log "🎯 TP order: fixed (TAKE_PROFIT_MARKET at TP price)"
     fi
     log "🔐 Lock profit: ${LOCK_PROFIT_ENABLED} (trigger ${LOCK_PROFIT_BE_PCT}% toward TP → SL at ${LOCK_PROFIT_SL_AT_PCT}% entry→TP)"
+    if declare -f _dca_enabled >/dev/null 2>&1 && _dca_enabled; then
+        log "📈 DCA: on (dist ${DCA_TRIGGER_PCT}%, max ${DCA_MAX_STEPS} adds, mult ${DCA_MULTIPLIER}, cooldown ${DCA_COOLDOWN_SECONDS}s)"
+    else
+        log "📈 DCA: off (set DCA_ENABLED=true)"
+    fi
     log "⏰ Order Cooldown: ${ORDER_COOLDOWN_SECONDS}s per symbol (local fallback without API)"
     if declare -f trading_schedule_summary >/dev/null 2>&1; then
         if _tr_sched_enabled 2>/dev/null; then

@@ -107,6 +107,19 @@ Example trailing TP (SHORT, TP `0.2025`, callback `0.5%`): when price reaches `0
 
 Example (SHORT): entry `1.00`, TP `0.90` → at **50%** progress toward TP the bot moves SL to **20%** of the range: `1.00 − 0.10×20%` = `0.98` (not full break-even). Needs `REST_PLACE_SL_TP=true` (or an existing STOP on Binance). Logs: `LOCK_PROFIT … stage=lock_sl`.
 
+### DCA (scale-in, same as entry)
+
+Requires `DCA_ENABLED=true`, `ORDER_EXECUTION_MODE=rest`, and a **filled position**. When price moves at least **`DCA_TRIGGER_PCT`** % against the position since the last entry/DCA price, the bot runs the **same OB signal** as a normal open (`determine_signal_ob_core` + `calculate_tp_sl` + **LIMIT**). The % is only a **minimum distance** between adds.
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `DCA_TRIGGER_PCT` | Min adverse move % since last add/entry | `0.4` |
+| `DCA_MAX_STEPS` | Max DCA adds after the initial entry | `3` |
+| `DCA_MULTIPLIER` | Size factor per step (`1` = equal, `2` = martingale) | `1.0` |
+| `DCA_COOLDOWN_SECONDS` | Min seconds between DCA attempts | `120` |
+
+Notional per DCA add: `base × DCA_MULTIPLIER^(step+1)` where `base` is the first entry size. Dashboard Status column: `DCA1`, … (Position stays `OPEN`). Logs: `DCA_SIGNAL`, `DCA_ADD`.
+
 Logs are written to `logs/bot.log`, `logs/errors.log`, and `logs/trades.log` (the `logs/` folder is created on startup).
 
 ## Hosting
