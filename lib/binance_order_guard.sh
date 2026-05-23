@@ -1260,6 +1260,49 @@ _futures_place_reduce_conditional() {
     return 1
 }
 
+# Cancel open SL / TP / trailing reduce algo orders for symbol
+futures_cancel_sl_tp_algo_orders() {
+    local symbol="$1"
+    local log_fn="${2:-}"
+    local resp cancelled=0 dry_run algo_id del_resp
+
+    dry_run="${DRY_RUN:-false}"
+    if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
+        return 1
+    fi
+
+    resp=$(_binance_fapi_signed_get "/fapi/v1/openAlgoOrders" "symbol=${symbol}")
+    [ -z "$resp" ] && return 1
+    echo "$resp" | jq -e '.total // .orders // .[0]' >/dev/null 2>&1 || return 1
+
+    while IFS= read -r algo_id; do
+        [ -z "$algo_id" ] || [ "$algo_id" = "null" ] && continue
+        if [ "$dry_run" = true ]; then
+            cancelled=$((cancelled + 1))
+            continue
+        fi
+        del_resp=$(_binance_fapi_signed_delete "/fapi/v1/algoOrder" "symbol=${symbol}&algoId=${algo_id}")
+        if echo "$del_resp" | jq -e '.algoId' >/dev/null 2>&1; then
+            cancelled=$((cancelled + 1))
+        elif [ -n "$log_fn" ]; then
+            $log_fn "⚠️ Cancel SL/TP algo $symbol algoId=$algo_id: $del_resp"
+        fi
+    done < <(echo "$resp" | jq -r '
+        (if .orders then .orders else . end) | .[]?
+        | select(
+            .orderType == "STOP_MARKET" or .type == "STOP_MARKET"
+            or .orderType == "TAKE_PROFIT_MARKET" or .type == "TAKE_PROFIT_MARKET"
+            or .orderType == "TRAILING_STOP_MARKET" or .type == "TRAILING_STOP_MARKET"
+          )
+        | select(
+            (.algoStatus // .status // "NEW") == "NEW"
+            or (.algoStatus // .status) == "ACTIVE"
+          )
+        | .algoId' 2>/dev/null)
+
+    echo "$cancelled"
+}
+
 # Trailing take-profit: activates at TP price, closes on pullback (callbackRate %)
 _futures_place_trailing_tp() {
     local symbol="$1"
@@ -1327,6 +1370,7 @@ futures_place_sl_tp_after_entry() {
     local quantity="$5"
     local entry_order_id="$6"
     local log_fn="${7:-}"
+    local order_kind="${8:-entry}"
 
     local enabled="${REST_PLACE_SL_TP:-true}"
     case "$(echo "$enabled" | tr '[:upper:]' '[:lower:]')" in
@@ -1365,15 +1409,66 @@ futures_place_sl_tp_after_entry() {
         return 1
     fi
 
+    local sl_ok=1 tp_ok=1
+    local entry_ref avg_entry pos_info change spread best_bid best_ask cancelled tp_sl_data
+
+    if [ "$order_kind" = "dca" ]; then
+        if declare -f futures_cancel_sl_tp_algo_orders >/dev/null 2>&1; then
+            cancelled=$(futures_cancel_sl_tp_algo_orders "$symbol" "$log_fn")
+            if [ "${cancelled:-0}" -gt 0 ]; then
+                [ -n "$log_fn" ] && $log_fn "🔄 $symbol: cancelled ${cancelled} SL/TP algo(s) for DCA refresh"
+                if declare -f log_trade >/dev/null 2>&1; then
+                    log_trade "DCA_REFRESH_CANCEL $symbol count=${cancelled}"
+                fi
+            fi
+        fi
+        if declare -f futures_get_position >/dev/null 2>&1; then
+            pos_info=$(futures_get_position "$symbol" "$direction")
+            if [ "$pos_info" != "none" ]; then
+                fill_qty=$(echo "$pos_info" | cut -d'|' -f2)
+            fi
+        fi
+        if declare -f futures_get_position_entry_price >/dev/null 2>&1 \
+            && avg_entry=$(futures_get_position_entry_price "$symbol" "$direction" 2>/dev/null); then
+            entry_ref="$avg_entry"
+            if declare -f ob_set >/dev/null 2>&1; then
+                ob_set LAST_ENTRY "$symbol" "$avg_entry"
+                ob_set LOCK_PROFIT_STAGE "$symbol" ""
+            fi
+            if declare -f calculate_tp_sl >/dev/null 2>&1 && declare -f ob_get >/dev/null 2>&1; then
+                change=$(ob_get CHANGE24 "$symbol")
+                best_bid=$(ob_get BID "$symbol")
+                best_ask=$(ob_get ASK "$symbol")
+                spread=0
+                if [ "$best_bid" != "0" ] && [ "$best_ask" != "0" ] \
+                    && [ "$best_bid" != "null" ] && [ "$best_ask" != "null" ]; then
+                    spread=$(echo "$best_ask - $best_bid" | bc -l 2>/dev/null)
+                fi
+                tp_sl_data=$(calculate_tp_sl "$avg_entry" "$direction" "$change" "$spread" "$symbol")
+                sl=$(echo "$tp_sl_data" | cut -d'|' -f1)
+                tp=$(echo "$tp_sl_data" | cut -d'|' -f2)
+                if declare -f ob_set >/dev/null 2>&1; then
+                    ob_set LAST_SL "$symbol" "$sl"
+                    ob_set LAST_TP "$symbol" "$tp"
+                fi
+            fi
+            [ -n "$log_fn" ] && $log_fn "📐 $symbol: DCA filled — SL/TP from avg entry $avg_entry qty=$fill_qty sl=$sl tp=$tp"
+            if declare -f log_trade >/dev/null 2>&1; then
+                log_trade "DCA_REFRESH_SLTP $symbol $direction avg_entry=$avg_entry qty=$fill_qty sl=$sl tp=$tp"
+            fi
+        else
+            entry_ref=$(ob_get LAST_ENTRY "$symbol" 2>/dev/null)
+            [ -z "$entry_ref" ] && entry_ref="0"
+        fi
+    else
+        entry_ref=$(ob_get LAST_ENTRY "$symbol" 2>/dev/null)
+        [ -z "$entry_ref" ] && entry_ref="0"
+    fi
+
     if declare -f round_price_for_symbol >/dev/null 2>&1; then
         sl=$(round_price_for_symbol "$symbol" "$sl")
         tp=$(round_price_for_symbol "$symbol" "$tp")
     fi
-
-    local sl_ok=1 tp_ok=1
-    local entry_ref
-    entry_ref=$(ob_get LAST_ENTRY "$symbol" 2>/dev/null)
-    [ -z "$entry_ref" ] && entry_ref="0"
 
     if [ -n "$sl" ] && _bn_is_positive "$sl"; then
         local sl_valid=0

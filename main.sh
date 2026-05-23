@@ -510,7 +510,7 @@ Entry: $entry | ${tp_label} | SL: $sl | Vol: ${vol_usdt} USDT"
                 export TP_ORDER_TYPE TP_TRAILING_CALLBACK_RATE
                 export DCA_ENABLED DCA_TRIGGER_PCT DCA_MAX_STEPS DCA_MULTIPLIER DCA_COOLDOWN_SECONDS
                 export BINANCE_HEDGE_MODE BINANCE_POSITION_MODE
-                futures_place_sl_tp_after_entry "$symbol" "$direction" "$sl" "$tp" "$quantity" "$order_id" log
+                futures_place_sl_tp_after_entry "$symbol" "$direction" "$sl" "$tp" "$quantity" "$order_id" log "$order_kind"
             ) &
         fi
         return 0
@@ -810,6 +810,7 @@ get_24h_change() {
 # ============================================
 
 declare -a SYMBOL_ARRAY
+declare -a DASHBOARD_SYMBOLS_SORTED
 CURRENT_INDEX=0
 NUM_SYMBOLS=0
 LAST_CYCLE_TIME=0
@@ -1143,6 +1144,28 @@ update_24h_changes() {
     done
 }
 
+# Fill DASHBOARD_SYMBOLS_SORTED by 24h change (desc: top gainers first)
+_dashboard_build_sorted_symbols() {
+    local symbol change pairs=() sorted_line
+
+    DASHBOARD_SYMBOLS_SORTED=()
+    for symbol in "${SYMBOL_ARRAY[@]}"; do
+        change=$(ob_get CHANGE24 "$symbol")
+        change="${change//,/}"
+        change="${change// /}"
+        change="${change#+}"
+        change="${change%%%}"
+        [ -z "$change" ] || [ "$change" = "null" ] && change="0"
+        pairs+=("${change}|${symbol}")
+    done
+    if [ "${#pairs[@]}" -eq 0 ]; then
+        return 0
+    fi
+    while IFS= read -r sorted_line; do
+        [ -n "$sorted_line" ] && DASHBOARD_SYMBOLS_SORTED+=("$sorted_line")
+    done < <(printf '%s\n' "${pairs[@]}" | LC_ALL=C sort -t'|' -k1 -g -r | cut -d'|' -f2-)
+}
+
 # ============================================
 # DISPLAY AND EXECUTE
 # ============================================
@@ -1243,10 +1266,17 @@ draw_and_execute() {
     local signal_data signal confidence entry reasons sl tp
     local status_label pos_col closed_flag change_disp signal_dir reason_short
     local evt line
-    local -a _dash_notes=()
+    local -a _dash_notes=() _cycle_symbols=()
+
+    _dashboard_build_sorted_symbols
+    if [ "${#DASHBOARD_SYMBOLS_SORTED[@]}" -gt 0 ]; then
+        _cycle_symbols=("${DASHBOARD_SYMBOLS_SORTED[@]}")
+    else
+        _cycle_symbols=("${SYMBOL_ARRAY[@]}")
+    fi
 
     # --- Phase 1: update state, trade, build rows (no terminal output) ---
-    for symbol in "${SYMBOL_ARRAY[@]}"; do
+    for symbol in "${_cycle_symbols[@]}"; do
         price=$(ob_get PRICE "$symbol")
         best_bid=$(ob_get BID "$symbol")
         best_ask=$(ob_get ASK "$symbol")

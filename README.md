@@ -118,7 +118,7 @@ Requires `DCA_ENABLED=true`, `ORDER_EXECUTION_MODE=rest`, and a **filled positio
 | `DCA_MULTIPLIER` | Size factor per step (`1` = equal, `2` = martingale) | `1.0` |
 | `DCA_COOLDOWN_SECONDS` | Min seconds between DCA attempts | `120` |
 
-Notional per DCA add: `base × DCA_MULTIPLIER^(step+1)` where `base` is the first entry size. Dashboard Status column: `DCA1`, … (Position stays `OPEN`). Logs: `DCA_SIGNAL`, `DCA_ADD`.
+Notional per DCA add: `base × DCA_MULTIPLIER^(step+1)` where `base` is the first entry size. When a DCA limit **fills**, the bot cancels existing SL/TP/trailing algos and replaces them for the **full position** using Binance **average entry** and a fresh `calculate_tp_sl`. Dashboard Status column: `DCA1`, … Logs: `DCA_SIGNAL`, `DCA_ADD`, `DCA_REFRESH_SLTP`.
 
 Logs are written to `logs/bot.log`, `logs/errors.log`, and `logs/trades.log` (the `logs/` folder is created on startup).
 
