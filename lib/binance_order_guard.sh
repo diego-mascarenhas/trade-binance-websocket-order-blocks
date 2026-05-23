@@ -326,6 +326,7 @@ _futures_hydrate_open_leg() {
     local sl_tp entry sl tp
 
     ob_set ACTIVE "$symbol" "true"
+    ob_set EXPOSURE "$symbol" "position"
     ob_set POS_DIR "$symbol" "$direction"
     ob_set EXIT_NOTIFIED "$symbol" ""
 
@@ -347,6 +348,7 @@ _futures_hydrate_pending_entry() {
     local limit_price="${3:-}"
 
     ob_set ACTIVE "$symbol" "true"
+    ob_set EXPOSURE "$symbol" "pending"
     ob_set POS_DIR "$symbol" "$direction"
     ob_set EXIT_NOTIFIED "$symbol" ""
     if [ -n "$limit_price" ] && [ "$limit_price" != "0" ]; then
@@ -373,6 +375,7 @@ futures_get_pending_entry_limit() {
         if futures_has_open_limit_same_side "$symbol" "$direction"; then
             line=$(echo "$orders" | jq -r --arg dir "$direction" '
                 .[] | select(.type == "LIMIT" or .type == "LIMIT_MAKER")
+                | select((.reduceOnly // false) == false)
                 | . as $o
                 | ($dir == "LONG") as $want_long
                 | select(
@@ -460,6 +463,14 @@ sync_startup_configured_positions() {
     return 0
 }
 
+# Return 0 if symbol has a filled futures position (not merely a pending entry limit)
+futures_has_filled_position() {
+    local symbol="$1"
+    local pos_info
+    pos_info=$(futures_get_position "$symbol")
+    [ "$pos_info" != "none" ]
+}
+
 # Sync local ACTIVE/DCA with exchange; hydrate entry/TP/SL when position or limit exists
 sync_symbol_position_flags() {
     local symbol="$1"
@@ -467,11 +478,13 @@ sync_symbol_position_flags() {
         return 0
     fi
     local was_active=false skip_exit=0 suppress_ts pos_info pos_long pos_short
-    local pending_line pending_dir pending_price
+    local pending_line pending_dir pending_price prev_exposure
 
     if [ "$(ob_get ACTIVE "$symbol")" = "true" ]; then
         was_active=true
     fi
+    prev_exposure=$(ob_get EXPOSURE "$symbol")
+    [ "$prev_exposure" = "0" ] && prev_exposure=""
 
     if declare -f binance_is_hedge_mode >/dev/null 2>&1 && binance_is_hedge_mode; then
         pos_long=$(futures_get_position "$symbol" "LONG")
@@ -511,12 +524,14 @@ sync_symbol_position_flags() {
                 skip_exit=1
             fi
         fi
-        if [ "$skip_exit" -eq 0 ] && declare -f futures_notify_position_exit >/dev/null 2>&1; then
+        if [ "$skip_exit" -eq 0 ] && [ "$prev_exposure" = "position" ] \
+            && declare -f futures_notify_position_exit >/dev/null 2>&1; then
             futures_notify_position_exit "$symbol"
         fi
     fi
 
     ob_set ACTIVE "$symbol" "false"
+    ob_set EXPOSURE "$symbol" ""
     ob_set POS_DIR "$symbol" ""
     ob_set LAST_ENTRY "$symbol" ""
     ob_set LAST_TP "$symbol" ""
@@ -694,6 +709,7 @@ futures_cancel_open_entry_limits() {
             sync_symbol_position_flags "$symbol"
         elif declare -f ob_set >/dev/null 2>&1; then
             ob_set ACTIVE "$symbol" "false"
+            ob_set EXPOSURE "$symbol" ""
             ob_set POS_DIR "$symbol" ""
             ob_set LAST_ENTRY "$symbol" ""
             ob_set LAST_TP "$symbol" ""
@@ -773,6 +789,7 @@ futures_close_position_market() {
         fi
         if declare -f ob_set >/dev/null 2>&1; then
             ob_set ACTIVE "$symbol" "false"
+            ob_set EXPOSURE "$symbol" ""
             ob_set POS_DIR "$symbol" ""
             ob_set LAST_ENTRY "$symbol" ""
             ob_set LAST_TP "$symbol" ""
@@ -782,7 +799,7 @@ futures_close_position_market() {
             ob_set DCA_DIR "$symbol" ""
             ob_set DCA_SL "$symbol" ""
             ob_set DCA_TP "$symbol" ""
-            ob_set OB_CLOSE_SUPPRESS "$symbol" ""
+            ob_set OB_CLOSE_SUPPRESS "$symbol" "$(date +%s)"
             ob_set EXIT_NOTIFIED "$symbol" "1"
         fi
         if declare -f send_telegram_position >/dev/null 2>&1; then
@@ -923,6 +940,7 @@ futures_has_open_limit_same_side() {
 
     count=$(echo "$orders" | jq -r --arg side "$side" --arg ps "$want_pos_side" '
         [.[] | select(.type == "LIMIT" or .type == "LIMIT_MAKER")
+         | select((.reduceOnly // false) == false)
          | select(.side == $side)
          | select(
              ($ps == "LONG" or $ps == "SHORT") as $hedge |
@@ -979,6 +997,7 @@ futures_has_limit_at_price() {
         fi
     done < <(echo "$orders" | jq -r '
         .[] | select(.type == "LIMIT" or .type == "LIMIT_MAKER")
+        | select((.reduceOnly // false) == false)
         | "\(.side)|\(.price)|\(.positionSide // "")"' 2>/dev/null)
 
     return 1

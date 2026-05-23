@@ -452,6 +452,7 @@ LIMIT #OPEN $direction
 Entry: $entry | ${tp_label} | SL: $sl | Vol: ${vol_usdt} USDT"
 
         ob_set ACTIVE "$symbol" "true"
+        ob_set EXPOSURE "$symbol" "pending"
         ob_set ACTIVE_TS "$symbol" "$(date +%s)"
         ob_set POS_DIR "$symbol" "$direction"
         ob_set LAST_ENTRY "$symbol" "$entry"
@@ -620,6 +621,7 @@ ob_replace_stale_entry_limits() {
     fi
 
     ob_set ACTIVE "$symbol" "false"
+    ob_set EXPOSURE "$symbol" ""
     ob_set POS_DIR "$symbol" ""
     ob_set LAST_ENTRY "$symbol" ""
     ob_set LAST_TP "$symbol" ""
@@ -830,9 +832,9 @@ determine_signal() {
     local current_price="$2"
     local change_24h="$3"
     
-    # Block when any significant position exists (both legs in hedge mode)
-    if declare -f futures_has_open_position >/dev/null 2>&1 \
-        && futures_has_open_position "$symbol"; then
+    # Block when any significant filled position exists (both legs in hedge mode)
+    if declare -f futures_has_filled_position >/dev/null 2>&1 \
+        && futures_has_filled_position "$symbol"; then
         echo "NEUTRAL|0|0|Position already open"
         return
     fi
@@ -1094,6 +1096,7 @@ _dashboard_color_row() {
         OK) stat_c="$GREEN" ;;
         WATCH) stat_c="$YELLOW" ;;
         OPEN) stat_c="$CYAN" ;;
+        PEND) stat_c="$YELLOW" ;;
         CLOSE) stat_c="$MAGENTA" ;;
         *) stat_c="$WHITE" ;;
     esac
@@ -1113,6 +1116,7 @@ _dashboard_color_row() {
     pos_c="$WHITE"
     case "$pos" in
         OPEN) pos_c="$RED" ;;
+        PEND) pos_c="$YELLOW" ;;
         CLOSE) pos_c="$MAGENTA" ;;
     esac
 
@@ -1160,11 +1164,13 @@ draw_and_execute() {
         fi
 
         pos_col="--"
-        if [ "$(ob_get ACTIVE "$symbol")" = "true" ]; then
+        if declare -f futures_has_filled_position >/dev/null 2>&1 \
+            && futures_has_filled_position "$symbol"; then
             pos_col="OPEN"
-        elif declare -f futures_has_open_position >/dev/null 2>&1 \
-            && futures_has_open_position "$symbol"; then
-            pos_col="OPEN"
+        elif [ "$(ob_get EXPOSURE "$symbol")" = "pending" ] \
+            || { declare -f futures_get_pending_entry_limit >/dev/null 2>&1 \
+                && futures_get_pending_entry_limit "$symbol" >/dev/null 2>&1; }; then
+            pos_col="PEND"
         fi
 
         closed_flag=0
@@ -1193,7 +1199,7 @@ draw_and_execute() {
         fi
 
         signal_dir="$signal"
-        if [ "$pos_col" = "OPEN" ] || [ "$pos_col" = "CLOSE" ]; then
+        if [ "$pos_col" = "OPEN" ] || [ "$pos_col" = "PEND" ] || [ "$pos_col" = "CLOSE" ]; then
             local stored_entry stored_tp stored_sl stored_dir
             stored_entry=$(ob_get LAST_ENTRY "$symbol")
             stored_tp=$(ob_get LAST_TP "$symbol")
@@ -1216,6 +1222,8 @@ draw_and_execute() {
         status_label=$(_dashboard_status_label "$signal" "$confidence" "$MIN_CONFIDENCE" "$closed_flag")
         if [ "$pos_col" = "OPEN" ]; then
             status_label="OPEN"
+        elif [ "$pos_col" = "PEND" ]; then
+            status_label="PEND"
         fi
 
         change_disp="$change"
