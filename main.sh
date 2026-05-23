@@ -56,6 +56,10 @@ if [ -f "$SCRIPT_DIR/lib/binance_order_guard.sh" ]; then
     # shellcheck source=lib/binance_order_guard.sh
     source "$SCRIPT_DIR/lib/binance_order_guard.sh"
 fi
+if [ -f "$SCRIPT_DIR/lib/binance_wallet_leverage.sh" ]; then
+    # shellcheck source=lib/binance_wallet_leverage.sh
+    source "$SCRIPT_DIR/lib/binance_wallet_leverage.sh"
+fi
 if [ -f "$SCRIPT_DIR/lib/binance_lock_profit.sh" ]; then
     # shellcheck source=lib/binance_lock_profit.sh
     source "$SCRIPT_DIR/lib/binance_lock_profit.sh"
@@ -97,8 +101,12 @@ SL_VOLATILE_MIN="${SL_VOLATILE_MIN:-0.8}"
 TP_VOLATILE_MIN="${TP_VOLATILE_MIN:-1.0}"
 MIN_SL_SPREAD_MULT="${MIN_SL_SPREAD_MULT:-3}"
 
-# Position size
+# Position size: fixed USDT or % of futures wallet (POSITION_WALLET_PCT)
 POSITION_SIZE_USDT="${POSITION_SIZE_USDT:-50}"
+POSITION_SIZE_MODE="${POSITION_SIZE_MODE:-wallet_pct}"
+POSITION_WALLET_PCT="${POSITION_WALLET_PCT:-10}"
+# Leverage: max = symbol max from Binance | fixed = LEVERAGE
+LEVERAGE_MODE="${LEVERAGE_MODE:-max}"
 LEVERAGE="${LEVERAGE:-5}"
 
 # Cooldown between orders for same symbol (seconds)
@@ -125,8 +133,8 @@ ZONE_LOWER_PCT="${ZONE_LOWER_PCT:-25}"
 
 # Lock profit: move SL toward break-even as price advances toward TP (TP unchanged)
 LOCK_PROFIT_ENABLED="${LOCK_PROFIT_ENABLED:-true}"
-LOCK_PROFIT_BE_PCT="${LOCK_PROFIT_BE_PCT:-50}"
-LOCK_PROFIT_SL_AT_PCT="${LOCK_PROFIT_SL_AT_PCT:-20}"
+LOCK_PROFIT_BE_PCT="${LOCK_PROFIT_BE_PCT:-70}"
+LOCK_PROFIT_SL_AT_PCT="${LOCK_PROFIT_SL_AT_PCT:-40}"
 LOCK_PROFIT_BUFFER_PCT="${LOCK_PROFIT_BUFFER_PCT:-0.05}"
 LOCK_PROFIT_STAGE2_PCT="${LOCK_PROFIT_STAGE2_PCT:-0}"
 LOCK_PROFIT_LOCK_RATIO="${LOCK_PROFIT_LOCK_RATIO:-0.5}"
@@ -320,17 +328,21 @@ check_open_position() {
 
 set_leverage() {
     local symbol="$1"
-    
+
+    if declare -f futures_set_symbol_leverage >/dev/null 2>&1; then
+        futures_set_symbol_leverage "$symbol" "" log >/dev/null 2>&1
+        return $?
+    fi
+
     if [ -z "$BINANCE_API_KEY" ] || [ -z "$BINANCE_SECRET_KEY" ]; then
         return 1
     fi
-    
-    local timestamp
+
+    local timestamp query_string signature
     timestamp=$(binance_timestamp_ms)
-    local query_string="symbol=$symbol&leverage=$LEVERAGE&timestamp=$timestamp&recvWindow=5000"
-    local signature
+    query_string="symbol=$symbol&leverage=$LEVERAGE&timestamp=$timestamp&recvWindow=5000"
     signature=$(echo -n "$query_string" | openssl dgst -sha256 -hmac "$BINANCE_SECRET_KEY" | awk '{print $2}')
-    
+
     curl -s -X POST "https://fapi.binance.com/fapi/v1/leverage" \
         -H "X-MBX-APIKEY: $BINANCE_API_KEY" \
         -d "$query_string&signature=$signature" > /dev/null 2>&1
@@ -343,14 +355,20 @@ set_leverage() {
 calculate_quantity() {
     local symbol="$1"
     local entry_price="$2"
-    
+    local notional_usdt raw_quantity
+
     if [ -z "$entry_price" ] || ! (( $(echo "$entry_price > 0" | bc -l 2>/dev/null) )); then
         echo "0.001"
         return 0
     fi
-    
-    local raw_quantity
-    raw_quantity=$(bc_safe_div "$POSITION_SIZE_USDT" "$entry_price")
+
+    if declare -f calculate_position_notional_usdt >/dev/null 2>&1; then
+        notional_usdt=$(calculate_position_notional_usdt)
+    else
+        notional_usdt="${POSITION_SIZE_USDT:-50}"
+    fi
+
+    raw_quantity=$(bc_safe_div "$notional_usdt" "$entry_price")
     round_qty_for_symbol "$symbol" "$raw_quantity"
 }
 
@@ -366,19 +384,25 @@ send_order_binance_rest() {
         return 1
     fi
     
-    local quantity vol_usdt
+    local quantity vol_usdt notional_usdt lev_applied
     quantity=$(calculate_quantity "$symbol" "$entry")
+    if declare -f calculate_position_notional_usdt >/dev/null 2>&1; then
+        notional_usdt=$(calculate_position_notional_usdt)
+    else
+        notional_usdt="${POSITION_SIZE_USDT:-?}"
+    fi
     if declare -f format_position_volume_usdt >/dev/null 2>&1; then
         vol_usdt=$(format_position_volume_usdt "$symbol" "$entry" "$quantity")
     else
-        vol_usdt="${POSITION_SIZE_USDT:-?}"
+        vol_usdt="${notional_usdt}"
     fi
     local side="BUY"
     if [ "$direction" = "SHORT" ]; then
         side="SELL"
     fi
-    
-    set_leverage "$symbol"
+
+    lev_applied=$(futures_set_symbol_leverage "$symbol" "" log 2>/dev/null)
+    [ -z "$lev_applied" ] && set_leverage "$symbol"
     sleep 0.3
     
     local timestamp
@@ -393,7 +417,11 @@ send_order_binance_rest() {
     local signature
     signature=$(echo -n "$query_string" | openssl dgst -sha256 -hmac "$BINANCE_SECRET_KEY" | awk '{print $2}')
     
-    log "📝 [REST] $symbol $direction | Entry:$entry SL:$sl TP:$tp | Vol:${vol_usdt} USDT"
+    local size_note="fixed ${POSITION_SIZE_USDT} USDT"
+    if declare -f _position_size_uses_wallet_pct >/dev/null 2>&1 && _position_size_uses_wallet_pct; then
+        size_note="${POSITION_WALLET_PCT}% wallet (~${notional_usdt} USDT)"
+    fi
+    log "📝 [REST] $symbol $direction | Entry:$entry SL:$sl TP:$tp | Vol:${vol_usdt} USDT | Lev:${lev_applied:-${LEVERAGE}}x | Size:${size_note}"
     
     if [ "$DRY_RUN" = true ]; then
         log "🔍 DRY-RUN: Would execute"
@@ -451,8 +479,16 @@ send_order_finandy() {
     quantity=$(calculate_quantity "$symbol" "$entry")
     if declare -f format_position_volume_usdt >/dev/null 2>&1; then
         vol_usdt=$(format_position_volume_usdt "$symbol" "$entry" "$quantity")
+    elif declare -f calculate_position_notional_usdt >/dev/null 2>&1; then
+        vol_usdt=$(calculate_position_notional_usdt)
     else
         vol_usdt="${POSITION_SIZE_USDT:-?}"
+    fi
+
+    if declare -f futures_set_symbol_leverage >/dev/null 2>&1; then
+        futures_set_symbol_leverage "$symbol" "" log >/dev/null 2>&1
+    else
+        set_leverage "$symbol"
     fi
 
     local side="buy" pos_side="long"
@@ -1345,6 +1381,16 @@ main() {
         log "📊 Symbols: ${SYMBOLS}"
     fi
     log "🎯 Min Confidence: ${MIN_CONFIDENCE}%"
+    if declare -f _position_size_uses_wallet_pct >/dev/null 2>&1 && _position_size_uses_wallet_pct; then
+        log "💰 Position size: ${POSITION_WALLET_PCT}% of futures wallet (fallback fixed ${POSITION_SIZE_USDT} USDT)"
+    else
+        log "💰 Position size: fixed ${POSITION_SIZE_USDT} USDT"
+    fi
+    if declare -f _leverage_mode_is_max >/dev/null 2>&1 && _leverage_mode_is_max; then
+        log "⚙️ Leverage: max per symbol (LEVERAGE_MODE=max, fallback ${LEVERAGE}x)"
+    else
+        log "⚙️ Leverage: fixed ${LEVERAGE}x"
+    fi
     log "📐 TP/SL mode: ${TP_SL_MODE} (ob_grid: SHORT SL=R1 TP=S0, LONG SL=S1 TP=R0)"
     if declare -f ob_tp_sl_mode_is_grid >/dev/null 2>&1 && ob_tp_sl_mode_is_grid; then
         log "   OB wall shift: ${OB_WALL_SHIFT_PCT}% | buffers SL=${SL_OB_BUFFER_PCT}% TP=${TP_OB_BUFFER_PCT}%"

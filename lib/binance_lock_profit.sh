@@ -181,8 +181,8 @@ futures_try_lock_profit() {
 
     local progress be_pct stage2_pct buffer_pct lock_ratio sl_at_pct new_sl
     progress=$(_lock_profit_progress_pct "$direction" "$entry" "$tp" "$current_price")
-    be_pct="${LOCK_PROFIT_BE_PCT:-50}"
-    sl_at_pct="${LOCK_PROFIT_SL_AT_PCT:-20}"
+    be_pct="${LOCK_PROFIT_BE_PCT:-70}"
+    sl_at_pct="${LOCK_PROFIT_SL_AT_PCT:-40}"
     stage2_pct="${LOCK_PROFIT_STAGE2_PCT:-0}"
     buffer_pct="${LOCK_PROFIT_BUFFER_PCT:-0.05}"
     lock_ratio="${LOCK_PROFIT_LOCK_RATIO:-0.5}"

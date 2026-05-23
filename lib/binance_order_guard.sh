@@ -94,6 +94,9 @@ format_position_volume_usdt() {
     elif [ -n "$symbol" ] && [ -n "$qty" ] && _bn_is_positive "$qty"; then
         vol=$(_futures_position_notional_usd "$symbol" "$qty")
         vol=$(echo "scale=2; ${vol:-0} / 1" | bc -l 2>/dev/null)
+    elif declare -f calculate_position_notional_usdt >/dev/null 2>&1; then
+        vol=$(calculate_position_notional_usdt)
+        vol=$(echo "scale=2; ${vol:-0} / 1" | bc -l 2>/dev/null)
     elif [ -n "${POSITION_SIZE_USDT:-}" ] && (( $(echo "${POSITION_SIZE_USDT} > 0" | bc -l 2>/dev/null) )); then
         vol=$(echo "scale=2; ${POSITION_SIZE_USDT} / 1" | bc -l 2>/dev/null)
     else

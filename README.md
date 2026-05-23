@@ -44,8 +44,11 @@ The **only entry script** in this project is `main.sh` (project root). All logic
 | `DEPTH` | Order book depth (5, 10, 20) | `10` |
 | `WS_SPEED` | Stream update speed | `500ms` |
 | `ORDER_EXECUTION_MODE` | `rest` or `finandy` | `rest` |
-| `POSITION_SIZE_USDT` | Notional size per trade | `50` |
-| `LEVERAGE` | Leverage | `5` |
+| `POSITION_SIZE_MODE` | `wallet_pct` or `fixed_usdt` | `wallet_pct` |
+| `POSITION_WALLET_PCT` | % of **totalWalletBalance** (USDT futures) per new order | `10` |
+| `POSITION_SIZE_USDT` | Fixed notional (fallback or `fixed_usdt` mode) | `50` |
+| `LEVERAGE_MODE` | `max` = symbol max leverage, `fixed` = `LEVERAGE` | `max` |
+| `LEVERAGE` | Leverage when `LEVERAGE_MODE=fixed` or max API fails | `5` |
 | `TP_SL_MODE` | `percent` or `ob_grid` (structural TP/SL from order-book walls) | `percent` |
 | `OB_WALL_SHIFT_PCT` | Min % move to promote current wall to R1/S1 | `0.15` |
 | `SL_OB_BUFFER_PCT` / `TP_OB_BUFFER_PCT` | Buffer % beyond grid SL/TP levels | `0.05` |
@@ -86,8 +89,8 @@ Set `TRADING_SCHEDULE_ENABLED=false` for 24/7 trading.
   - **LONG**: SL at **S1** (previous support), TP at **R0** (current resistance), entry near **S0**.
   - If grid geometry is invalid or R1/S1 missing, falls back to `percent` for that order.
 | `LOCK_PROFIT_ENABLED` | Tighten SL as price nears TP (`ORDER_EXECUTION_MODE=rest`) | `true` |
-| `LOCK_PROFIT_BE_PCT` | % toward TP before SL is moved (trigger) | `50` |
-| `LOCK_PROFIT_SL_AT_PCT` | Where to place SL: % of entry→TP distance from entry | `20` |
+| `LOCK_PROFIT_BE_PCT` | % toward TP before SL is moved (trigger) | `70` |
+| `LOCK_PROFIT_SL_AT_PCT` | Where to place SL: % of entry→TP distance from entry | `40` |
 | `LOCK_PROFIT_BUFFER_PCT` | Fallback buffer if `LOCK_PROFIT_SL_AT_PCT=0` (legacy break-even) | `0.05` |
 | `LOCK_PROFIT_STAGE2_PCT` | Optional 2nd stage: lock % of open profit (`0` = off) | `0` |
 
